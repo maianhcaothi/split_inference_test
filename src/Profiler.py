@@ -1,4 +1,5 @@
 import os
+import pickle
 import time
 import numpy as np
 import torch
@@ -70,3 +71,44 @@ def profile_or_load(model_name: str, model, device: str,
         "green"
     )
     return avg
+
+
+def measure_bandwidth(channel, client_id: str,
+                      payload_size_mb: float = 1.0,
+                      runs: int = 3) -> float:
+    """
+    Đo băng thông uplink (edge → server) qua RabbitMQ.
+    Gửi payload kích thước biết trước, đợi server ACK, tính throughput.
+    Returns: bandwidth ước tính (MB/s).
+    """
+    reply_queue = f"reply_{client_id}"
+    channel.queue_declare(reply_queue, durable=False)
+
+    payload = os.urandom(int(payload_size_mb * 1024 * 1024))
+
+    samples = []
+    for _ in range(runs):
+        message = pickle.dumps({
+            "action": "BW_TEST",
+            "client_id": client_id,
+            "payload": payload,
+        })
+        t_start = time.perf_counter()
+        channel.basic_publish(exchange='', routing_key='rpc_queue', body=message)
+
+        while True:
+            _, _, body = channel.basic_get(queue=reply_queue, auto_ack=True)
+            if body:
+                break
+            time.sleep(0.005)
+
+        elapsed = time.perf_counter() - t_start
+        samples.append(payload_size_mb / max(elapsed, 1e-6))
+
+    bw = float(np.median(samples))
+    Log.print_with_color(
+        f"[Bandwidth] {bw:.1f} MB/s  "
+        f"(samples: {[f'{s:.1f}' for s in samples]} MB/s, payload={payload_size_mb} MB x{runs})",
+        "cyan"
+    )
+    return bw

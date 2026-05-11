@@ -72,8 +72,18 @@ if __name__ == "__main__":
         except Exception as e:
             src.Log.print_with_color(f"[Profile] Warning: {e}", "yellow")
 
+    bandwidth_mb_s = None
+    clustering_cfg = config.get("clustering", {})
+    if clustering_cfg.get("enable", False):
+        try:
+            from src.Profiler import measure_bandwidth
+            bandwidth_mb_s = measure_bandwidth(channel, str(client_id))
+        except Exception as e:
+            src.Log.print_with_color(f"[Bandwidth] Warning: {e}", "yellow")
+
     data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
-            "message": "Hello from Client!", "layer_times": layer_times}
+            "message": "Hello from Client!", "layer_times": layer_times,
+            "bandwidth_mb_s": bandwidth_mb_s}
     scheduler = Scheduler(client_id, args.layer_id, channel, device)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")

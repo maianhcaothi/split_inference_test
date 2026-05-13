@@ -5,7 +5,7 @@ server:
     - 1 #edge
     - 1 #cloud
   model: yolo26n
-  batch-size: 4
+  batch-size: 32
 experiment:
   enable: False  #False
   mode: only_cloud

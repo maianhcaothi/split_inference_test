@@ -194,6 +194,7 @@ class Scheduler:
 
             if len(input_image) == batch_size:
                 batch_start = time.perf_counter()
+                edge_start_wall = time.time()
 
                 input_image = torch.stack(input_image)
                 input_image = input_image.to(self.device)
@@ -205,7 +206,7 @@ class Scheduler:
                         "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
                         "width": width,
                         "height": height,
-                        "edge_start_time": batch_start
+                        "edge_start_time": edge_start_wall
                     }
 
                     self.send_next_layer(
@@ -234,7 +235,7 @@ class Scheduler:
                         "data": y,
                         "width": width,
                         "height": height,
-                        "edge_start_time": batch_start
+                        "edge_start_time": edge_start_wall
                     }
 
                     self.send_next_layer(
@@ -258,7 +259,7 @@ class Scheduler:
                     ram_mb=ram_mb,
                     message_size_bytes=msg_size,
                     e2e_latency_ms=e2e_latency_ms,
-                    edge_start_time=batch_start,
+                    edge_start_time=edge_start_wall,
                 )
 
                 batch_id += 1
@@ -306,7 +307,7 @@ class Scheduler:
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
                 y = received_data["data"]
-                edge_start_time = y.get("edge_start_time", batch_start)
+                edge_start_time = y.get("edge_start_time", time.time())
 
                 # ===== ONLY CLOUD =====
                 if mode == "only_cloud":
@@ -342,9 +343,10 @@ class Scheduler:
                 self._update_map(results, batch_id, batch_size)
 
                 batch_end = time.perf_counter()
+                cloud_end_wall = time.time()
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
-                e2e_latency_ms = (batch_end - edge_start_time) * 1000
+                e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
                 ram_mb = self.get_ram_mb()
 
                 self.write_metrics(

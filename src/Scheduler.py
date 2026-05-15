@@ -36,6 +36,7 @@ class Scheduler:
 
         self.map_metric = None
         self.gt_dict = {}
+        self._det_results = {}
         self._load_gt_dict()
 
     def get_ram_mb(self):
@@ -149,11 +150,17 @@ class Scheduler:
         Log.print_with_color(f"[mAP] Loaded GT for {len(self.gt_dict)} frames from '{gt_dir}'", "green")
 
     def _update_map(self, batch_results, batch_id, batch_size):
-        if self.map_metric is None:
-            return
         for img_idx, r in enumerate(batch_results):
             frame_num = batch_id * batch_size + img_idx + 1
-            if frame_num not in self.gt_dict:
+            self._det_results[frame_num] = [
+                {
+                    "box":   r["boxes"][i].cpu().tolist(),
+                    "score": round(float(r["scores"][i]), 4),
+                    "class": int(r["classes"][i]),
+                }
+                for i in range(len(r["boxes"]))
+            ]
+            if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
             self.map_metric.update(
                 [{"boxes":  r["boxes"].cpu().float(),
@@ -172,6 +179,13 @@ class Scheduler:
             print("=" * 50)
         except Exception as e:
             Log.print_with_color(f"[mAP] compute failed: {e}", "red")
+
+    def _write_detections_json(self):
+        import json
+        out = "detections.json"
+        with open(out, "w") as f:
+            json.dump({str(k): v for k, v in sorted(self._det_results.items())}, f)
+        Log.print_with_color(f"[Tracker] Saved {out} ({len(self._det_results)} frames)", "green")
 
     def send_to_server(self, message):
         self.channel.queue_declare('rpc_queue', durable=False)
@@ -582,6 +596,9 @@ class Scheduler:
                 f"frame alignment undefined for multi-edge mAP.", "yellow")
         else:
             self._print_map()
+
+        if self._det_results:
+            self._write_detections_json()
 
     def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
         if queue_name != self.intermediate_queue:

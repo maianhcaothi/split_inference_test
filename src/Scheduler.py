@@ -122,6 +122,7 @@ class Scheduler:
         try:
             from torchmetrics.detection import MeanAveragePrecision
             self.map_metric = MeanAveragePrecision(iou_type="bbox")
+            self.map_metric.warn_on_many_detections = False
         except ImportError:
             Log.print_with_color("[!] torchmetrics not installed, mAP disabled", "red")
             return
@@ -148,9 +149,12 @@ class Scheduler:
             }
         Log.print_with_color(f"[mAP] Loaded GT for {len(self.gt_dict)} frames from '{gt_dir}'", "green")
 
-    def _update_map(self, batch_results, batch_id, batch_size):
+    def _update_map(self, batch_results, batch_id, batch_size, map_results=None):
         import json
-        for img_idx, r in enumerate(batch_results):
+        # map_results uses conf≈0.001 so torchmetrics gets the full PR curve;
+        # batch_results (conf=0.25) is only for the detection stream / display.
+        _map = map_results if map_results is not None else batch_results
+        for img_idx, (r, rm) in enumerate(zip(batch_results, _map)):
             frame_num = batch_id * batch_size + img_idx + 1
             dets = [
                 {
@@ -166,9 +170,9 @@ class Scheduler:
             if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
             self.map_metric.update(
-                [{"boxes":  r["boxes"].cpu().float(),
-                  "scores": r["scores"].cpu().float(),
-                  "labels": r["classes"].cpu().long()}],
+                [{"boxes":  rm["boxes"].cpu().float(),
+                  "scores": rm["scores"].cpu().float(),
+                  "labels": rm["classes"].cpu().long()}],
                 [self.gt_dict[frame_num]]
             )
 
@@ -253,8 +257,9 @@ class Scheduler:
                     y = []
                     x, y = inference(model, input_image, y, 0, save_set)
 
-                    results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
-                    self._update_map(results, batch_id, batch_size)
+                    results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
+                    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                    self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                 # ===== SPLIT INFERENCE =====
                 else:
@@ -388,8 +393,9 @@ class Scheduler:
 
                     x = list_output[-1]
                     x, _ = inference(model, x, list_output, splits, save_set)
-                results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
-                self._update_map(results, batch_id, batch_size)
+                results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
+                map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                 batch_end = time.perf_counter()
                 cloud_end_wall = time.time()

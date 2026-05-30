@@ -7,7 +7,7 @@ import src.Log as Log
 
 
 def profile_or_load(model_name: str, model, device: str,
-                    batch_size: int = 4, warmup: int = 5, runs: int = 30):
+                    batch_size: int = 4, warmup: int = 10, runs: int = 100):
     """
     Profile per-layer inference time of model on device.
     Returns np.array of shape (n_layers,) — mean seconds per layer per batch.
@@ -30,7 +30,12 @@ def profile_or_load(model_name: str, model, device: str,
         "yellow"
     )
 
-    layers = model.model
+    # Load via Ultralytics YOLO (nhất quán với measure_time_layer.py)
+    from ultralytics import YOLO
+    _yolo = YOLO(f"{model_name}.pt")
+    _profile_model = _yolo.model.float().eval().to(device)
+
+    layers = _profile_model.model
     n = len(layers)
     t0 = {}
     layer_times = [[] for _ in range(n)]
@@ -52,15 +57,22 @@ def profile_or_load(model_name: str, model, device: str,
 
     dummy = torch.randn(batch_size, 3, 640, 640).to(device)
 
+    # Warmup — hooks ghi nhưng sẽ tính chung vào average (nhất quán với measure_time_layer.py)
     with torch.no_grad():
-        for r in range(warmup + runs):
-            model(dummy)
+        for _ in range(warmup):
+            _profile_model(dummy)
+
+    # Benchmark
+    with torch.no_grad():
+        for _ in range(runs):
+            _profile_model(dummy)
 
     for h in hooks:
         h.remove()
 
+    # Average TẤT CẢ measurements (warmup + benchmark) — nhất quán với measure_time_layer.py
     avg = np.array([
-        np.mean(layer_times[i][warmup:]) if len(layer_times[i]) > warmup else 0.0
+        np.mean(layer_times[i]) if layer_times[i] else 0.0
         for i in range(n)
     ])
 

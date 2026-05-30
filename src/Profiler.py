@@ -37,35 +37,51 @@ def profile_or_load(model_name: str, model, device: str,
 
     layers = _profile_model.model
     n = len(layers)
-    t0 = {}
-    layer_times = [[] for _ in range(n)]
+    is_cuda = (device != "cpu" and torch.cuda.is_available())
+    start_events = {}
+    end_events   = {}
+    layer_times  = [[] for _ in range(n)]
     hooks = []
 
     for i in range(n):
         def _pre(idx):
             def fn(m, inp):
-                t0[idx] = time.perf_counter()
+                if is_cuda:
+                    ev = torch.cuda.Event(enable_timing=True)
+                    ev.record()
+                    start_events[idx] = ev
+                else:
+                    start_events[idx] = time.perf_counter()
             return fn
 
         def _post(idx):
             def fn(m, inp, out):
-                layer_times[idx].append(time.perf_counter() - t0[idx])
+                if is_cuda:
+                    ev = torch.cuda.Event(enable_timing=True)
+                    ev.record()
+                    end_events[idx] = ev
+                else:
+                    layer_times[idx].append(time.perf_counter() - start_events[idx])
             return fn
 
         hooks.append(layers[i].register_forward_pre_hook(_pre(i)))
         hooks.append(layers[i].register_forward_hook(_post(i)))
 
-    dummy = torch.randn(batch_size, 3, 640, 640).to(device)
+    if is_cuda:
+        dummy = torch.randn(batch_size, 3, 640, 640).to(device).half()
+        _profile_model.half()
+    else:
+        dummy = torch.randn(batch_size, 3, 640, 640).to(device)
 
-    # Warmup — hooks ghi nhưng sẽ tính chung vào average (nhất quán với measure_time_layer.py)
+    # Warmup + Benchmark
     with torch.no_grad():
-        for _ in range(warmup):
+        for _ in range(warmup + runs):
             _profile_model(dummy)
-
-    # Benchmark
-    with torch.no_grad():
-        for _ in range(runs):
-            _profile_model(dummy)
+            if is_cuda:
+                torch.cuda.synchronize()
+                for i in range(n):
+                    t_ms = start_events[i].elapsed_time(end_events[i])
+                    layer_times[i].append(t_ms / 1000.0)
 
     for h in hooks:
         h.remove()

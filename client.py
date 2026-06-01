@@ -13,6 +13,7 @@ from src.Scheduler import Scheduler
 parser = argparse.ArgumentParser(description="Split learning framework")
 parser.add_argument('--layer_id', type=int, required=True, help='ID of layer, start from 1')
 parser.add_argument('--device', type=str, required=False, help='Device of client')
+parser.add_argument('--name', type=str, required=False, default=None, help='Name of this machine (e.g. machine-2, device-1)')
 
 args = parser.parse_args()
 
@@ -92,7 +93,7 @@ if __name__ == "__main__":
 
     data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
             "message": "Hello from Client!", "layer_times": layer_times,
-            "bandwidth_mb_s": bandwidth_mb_s}
+            "bandwidth_mb_s": bandwidth_mb_s, "client_name": args.name}
     scheduler = Scheduler(client_id, args.layer_id, channel, device)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")

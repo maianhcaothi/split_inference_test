@@ -54,6 +54,7 @@ class Server:
         self.client_assignments = {}    # {client_id: {"splits": int, "queue_name": str}}
         self.client_profile_data = {}   # {client_id_str: np.array of per-layer times}
         self.client_bandwidth_data = {} # {client_id_str: float MB/s}
+        self.client_name_data = {}      # {client_id_str: str name}
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
@@ -106,6 +107,10 @@ class Server:
                 self.client_bandwidth_data[str(client_id)] = float(bandwidth_mb_s)
                 src.Log.print_with_color(
                     f"[Bandwidth] Stored bandwidth from client {client_id}: {bandwidth_mb_s:.1f} MB/s", "cyan")
+
+            client_name = message.get("client_name", None)
+            if client_name:
+                self.client_name_data[str(client_id)] = client_name
 
             self.register_clients[layer_id - 1] += 1
 
@@ -187,8 +192,14 @@ class Server:
                 input_data_size=get_raw_input_mb(self.batch_size),
                 network_rates=rates_matrix,
             )
-            solver.client_type_names = [f"edge_{str(cid)[:8]}" for cid in edge_clients]
-            solver.cloud_type_names  = [f"cloud_{str(cid)[:8]}" for cid in cloud_clients]
+            solver.client_type_names = [
+                self.client_name_data.get(str(cid), f"edge_{str(cid)[:8]}")
+                for cid in edge_clients
+            ]
+            solver.cloud_type_names = [
+                self.client_name_data.get(str(cid), f"cloud_{str(cid)[:8]}")
+                for cid in cloud_clients
+            ]
             result = solver.solve_best_over_k("hungarian", max_clusters=max_clusters)["best_result"]
             print_result(result, solver, title="HUNGARIAN MATCHING RESULT (real profiles)")
         else:

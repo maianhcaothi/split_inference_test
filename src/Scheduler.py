@@ -260,6 +260,12 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
+                    while True:
+                        q = self.channel.queue_declare(self.intermediate_queue, passive=True)
+                        if q.method.message_count < 2:
+                            break
+                        time.sleep(0.5)
+
                     self.send_next_layer(
                         self.intermediate_queue,
                         y,
@@ -636,7 +642,10 @@ class Scheduler:
             self.channel.queue_declare(self.intermediate_queue, durable=False)
 
         if self.layer_id == 1:
-            self.first_layer(model, data, batch_size, splits, logger, compress, mode, save_set)
+            try:
+                self.first_layer(model, data, batch_size, splits, logger, compress, mode, save_set)
+            except Exception as e:
+                Log.print_with_color(f"[!] Connection lost: {e} — saving metrics anyway.", "yellow")
             if mode == "only_edge":
                 self._pivot_and_save()
         elif self.layer_id == num_layers:

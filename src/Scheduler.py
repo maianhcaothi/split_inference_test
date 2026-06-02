@@ -39,6 +39,17 @@ class Scheduler:
         self._load_gt_dict()
 
     def get_ram_mb(self):
+        try:
+            import subprocess, re
+            result = subprocess.run(
+                ['tegrastats', '--once'],
+                capture_output=True, text=True, timeout=2
+            )
+            m = re.search(r'RAM (\d+)/\d+MB', result.stdout)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
 
@@ -71,7 +82,7 @@ class Scheduler:
                 batch_id,
                 batch_size,
                 round(latency_ms, 3),
-                round(fps, 3),
+                round(fps, 3) if fps > 0 else "",  # fps=0 (first batch) → empty
                 round(ram_mb, 3),
                 message_size_bytes,
                 round(e2e_latency_ms, 3),
@@ -178,6 +189,10 @@ class Scheduler:
 
     def _print_map(self):
         if self.map_metric is None:
+            Log.print_with_color("[mAP] Skipped: groundtruth not found on this device (datasets/groundtruth/ missing)", "yellow")
+            return
+        if not self.gt_dict:
+            Log.print_with_color("[mAP] Skipped: groundtruth folder exists but no valid .txt files loaded", "yellow")
             return
         try:
             result = self.map_metric.compute()
@@ -525,7 +540,7 @@ class Scheduler:
         fieldnames = [
             "batch_id", "batch_size", "best_cut",
             "edge_device", "edge_latency_ms", "edge_fps", "edge_ram_mb", "edge_message_size_bytes",
-            "cloud_device", "cloud_latency_ms", "cloud_fps", "cloud_ram_mb", "cloud_message_size_bytes",
+            "cloud_device", "cloud_arrival_order", "cloud_latency_ms", "cloud_fps", "cloud_ram_mb", "cloud_message_size_bytes",
             "e2e_latency_ms",
         ]
 
@@ -543,6 +558,7 @@ class Scheduler:
                     "edge_ram_mb":             e.get("ram_mb", ""),
                     "edge_message_size_bytes": e.get("message_size_bytes", ""),
                     "cloud_device":            c.get("device_seq", ""),
+                    "cloud_arrival_order":     c.get("batch_id", ""),
                     "cloud_latency_ms":        c.get("latency_ms", ""),
                     "cloud_fps":               c.get("fps", ""),
                     "cloud_ram_mb":            c.get("ram_mb", ""),

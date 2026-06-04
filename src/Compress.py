@@ -124,7 +124,14 @@ def decode_quant_delta(buf):
             idx += int(num_changed * itemsize)
 
         q_curr = q_prev.copy()
-        q_curr[diff_bits.astype(bool)] = q_changed
+        mask_bool = diff_bits.astype(bool)
+        n_true = int(mask_bool.sum())
+        if len(q_changed) == n_true:
+            q_curr[mask_bool] = q_changed
+        else:
+            n = min(len(q_changed), n_true)
+            idx_true = np.where(mask_bool)[0][:n]
+            q_curr[idx_true] = q_changed[:n]
         batches.append((q_curr.astype(np.float32) * scale) + global_min)
         q_prev = q_curr
 

@@ -1,8 +1,8 @@
 import torch
 import cv2
 import pickle
+import traceback
 from tqdm import tqdm
-import copy
 import time
 import csv
 import os
@@ -13,20 +13,15 @@ from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
 
+RAM_SAFETY_FACTOR = 0.5  # only use up to 50% of available RAM for queue buffering
+RAW_FRAME_MB = 3 * 640 * 640 * 4 / (1024 * 1024)  # uncompressed float32 640x640x3 frame, ~4.69MB
+
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
         self.device = device
-
-        import glob as _glob
-        for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except PermissionError:
-                    Log.print_with_color(f"[!] Cannot delete {f} (file is open). Close it and retry.", "red")
 
         cid_short = str(client_id).replace('-', '')[:12]
         self._timing_log_edge  = f"timing_edge_{cid_short}.log"
@@ -50,6 +45,7 @@ class Scheduler:
         self.map_metric = None
         self.gt_dict = {}
         self._det_results = {}
+        self._map_updated = False
         self._load_gt_dict()
 
     def get_ram_mb(self):
@@ -66,6 +62,19 @@ class Scheduler:
             pass
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
+
+    def get_available_ram_mb(self):
+        return psutil.virtual_memory().available / (1024 * 1024)
+
+    def _send_ram_report(self, msg_mb):
+        available_mb = self.get_available_ram_mb()
+        max_queue = max(1, int((available_mb * RAM_SAFETY_FACTOR) / max(msg_mb, 1e-6)))
+        self.send_to_server({
+            "action": "RAM_REPORT",
+            "client_id": self.client_id,
+            "queue_name": self.intermediate_queue,
+            "max_queue": max_queue,
+        })
 
     def _check_control_queue(self):
         while True:
@@ -96,7 +105,7 @@ class Scheduler:
                     pass
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
-        file_path = f"metrics_raw_{str(self.client_id).replace('-', '')}.csv"
+        file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
         file_exists = os.path.exists(file_path)
 
         with open(file_path, "a", newline="") as f:
@@ -204,6 +213,7 @@ class Scheduler:
 
     def _update_map(self, batch_results, batch_id, batch_size, map_results=None):
         import json
+        self._map_updated = True
         # map_results uses conf≈0.001 so torchmetrics gets the full PR curve;
         # batch_results (conf=0.25) is only for the detection stream / display.
         _map = map_results if map_results is not None else batch_results
@@ -258,7 +268,6 @@ class Scheduler:
                                    body=pickle.dumps(message))
 
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
-        orig_images = []
         input_image = []
         model.eval()
         model.to(self.device)
@@ -282,19 +291,26 @@ class Scheduler:
             if not ret:
                 break
             frame = cv2.resize(frame, (640, 640))
-            orig_images.append(copy.deepcopy(frame))
             frame = frame.astype('float32') / 255.0
             tensor = torch.from_numpy(frame).permute(2, 0, 1)  # shape: (3, 640, 640)
             input_image.append(tensor)
 
             if len(input_image) == batch_size:
+                t_batch_ready = time.perf_counter()
+                gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 edge_start_wall = time.time()
 
+                _stack_start = time.perf_counter()
                 input_image = torch.stack(input_image)
                 input_image = input_image.to(self.device)
+                stack_ms = (time.perf_counter() - _stack_start) * 1000
+
+                inference_ms = 0.0
+                queue_wait_ms = 0.0
+                send_ms = 0.0
 
                 # ===== ONLY CLOUD =====
                 if mode == "only_cloud":
@@ -306,36 +322,69 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
-                    while True:
-                        q = self.channel.queue_declare(self.intermediate_queue, passive=True)
-                        if q.method.message_count < 2:
-                            break
-                        time.sleep(0.5)
+                    _wait_start = time.perf_counter()
+                    self._check_control_queue()
+                    queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
+                    _send_start = time.perf_counter()
                     self.send_next_layer(
                         self.intermediate_queue,
                         y,
                         {"enable": False}
                     )
+                    send_ms = (time.perf_counter() - _send_start) * 1000
 
                 # ===== ONLY EDGE =====
                 elif mode == "only_edge":
 
+                    _inf_start = time.perf_counter()
                     y = []
-                    x, y = inference(model, input_image, y, 0, save_set)
+                    with torch.no_grad():
+                        x, y = inference(model, input_image, y, 0, save_set)
+                    inference_ms = (time.perf_counter() - _inf_start) * 1000
 
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                     map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
 
+                    _wait_start = time.perf_counter()
+                    self._check_control_queue()
+                    queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
+
+                    _send_start = time.perf_counter()
+                    frames_cpu = input_image.cpu()
+                    payload = {
+                        "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
+                        "width": width,
+                        "height": height,
+                        "results": [
+                            {
+                                "boxes":   r["boxes"].cpu().numpy(),
+                                "scores":  r["scores"].cpu().numpy(),
+                                "classes": r["classes"].cpu().numpy(),
+                            }
+                            for r in results
+                        ],
+                        "edge_start_time": edge_start_wall,
+                    }
+                    body = pickle.dumps({"action": "OUTPUT", "data": payload})
+                    self.size_message = len(body)
+                    self.channel.basic_publish(exchange='', routing_key=self.intermediate_queue, body=body)
+                    send_ms = (time.perf_counter() - _send_start) * 1000
+
                 # ===== SPLIT INFERENCE =====
                 else:
 
+                    _inf_start = time.perf_counter()
                     y = []
-                    x, y = inference(model, input_image, y, 0, save_set)
+                    with torch.no_grad():
+                        x, y = inference(model, input_image, y, 0, save_set)
                     y[-1] = x
+                    inference_ms = (time.perf_counter() - _inf_start) * 1000
 
+                    _wait_start = time.perf_counter()
                     self._check_control_queue()
+                    queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     y = {
                         "data": y,
@@ -344,18 +393,23 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
+                    _send_start = time.perf_counter()
                     self.send_next_layer(
                         self.intermediate_queue,y,compress
                     )
+                    send_ms = (time.perf_counter() - _send_start) * 1000
                 batch_end = time.perf_counter()
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(time.time_ns()) + " output", file=_tf)
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
-                e2e_latency_ms = latency_ms if mode == "only_edge" else 0.0
+                e2e_latency_ms = 0.0
+                _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
+                ram_ms = (time.perf_counter() - _ram_start) * 1000
                 msg_size = self.size_message if self.size_message is not None else 0
 
+                _write_start = time.perf_counter()
                 self.write_metrics(
                     mode=mode,
                     role="edge_sender" if mode == "only_cloud" else "edge",
@@ -369,12 +423,21 @@ class Scheduler:
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_wall,
                 )
+                write_ms = (time.perf_counter() - _write_start) * 1000
+
+                batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
+                Log.print_with_color(
+                    f"[Timing][edge] gap={gap_ms:.1f}ms stack={stack_ms:.1f}ms "
+                    f"inference={inference_ms:.1f}ms queue_wait={queue_wait_ms:.1f}ms send={send_ms:.1f}ms "
+                    f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
+                    f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
+                    "magenta"
+                )
 
                 batch_id += 1
                 prev_batch_end = batch_end
 
                 input_image = []
-                orig_images = []
                 pbar.update(batch_size)
             else:
                 continue
@@ -385,7 +448,7 @@ class Scheduler:
         pbar.close()
 
         # Broadcast metrics CSV lên tất cả cloud trong cluster qua fanout exchange
-        metrics_file = f"metrics_raw_{str(self.client_id).replace('-', '')}.csv"
+        metrics_file = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
         if os.path.exists(metrics_file):
             try:
                 with open(metrics_file, 'rb') as f:
@@ -420,10 +483,18 @@ class Scheduler:
 
 
     def last_layer(self, model, batch_size, splits, logger, compress, mode="split", save_set=None):
-        model.eval()
-        model.to(self.device)
+        if mode != "only_edge":
+            model.eval()
+            model.to(self.device)
 
         self.channel.basic_qos(prefetch_count=10)
+
+        # Báo RAM ngay từ đầu (trước khi nhận batch nào) để server có ngưỡng
+        # dựa trên RAM thực tế thay vì dùng default HIGH=10/LOW=3.
+        # Ước lượng msg_mb bằng kích thước frame thô chưa nén (worst-case cho
+        # only_cloud/only_edge, conservative cho split vì feature map thường nhỏ hơn).
+        self._send_ram_report(RAW_FRAME_MB * batch_size)
+
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
@@ -432,6 +503,8 @@ class Scheduler:
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
             if method_frame and body:
+                t_batch_ready = time.perf_counter()
+                gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
@@ -440,19 +513,28 @@ class Scheduler:
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
 
+                # ===== ONLY EDGE (cloud just receives lightweight results) =====
+                if mode == "only_edge":
+                    decode_ms = 0.0
+                    inference_ms = 0.0
                 # ===== ONLY CLOUD =====
-                if mode == "only_cloud":
+                elif mode == "only_cloud":
+                    _decode_start = time.perf_counter()
                     input_tensor = y["data"]
 
                     if isinstance(input_tensor, list):
                         input_tensor = torch.stack(input_tensor)
 
                     input_tensor = input_tensor.to(self.device)
+                    decode_ms = (time.perf_counter() - _decode_start) * 1000
 
-                    x, _ = inference(model, input_tensor, [], 0, save_set)
+                    _inf_start = time.perf_counter()
+                    with torch.no_grad():
+                        x, _ = inference(model, input_tensor, [], 0, save_set)
+                    inference_ms = (time.perf_counter() - _inf_start) * 1000
                 # ===== SPLIT INFERENCE =====
                 else:
-
+                    _decode_start = time.perf_counter()
                     if compress["enable"]:
                         y["data"] = Decoder(y["data"], y["shape"])
 
@@ -469,10 +551,21 @@ class Scheduler:
                     list_output = y["data"]
 
                     x = list_output[-1]
-                    x, _ = inference(model, x, list_output, splits, save_set)
-                results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
-                map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                self._update_map(results, batch_id, batch_size, map_results=map_results)
+                    decode_ms = (time.perf_counter() - _decode_start) * 1000
+
+                    _inf_start = time.perf_counter()
+                    with torch.no_grad():
+                        x, _ = inference(model, x, list_output, splits, save_set)
+                    inference_ms = (time.perf_counter() - _inf_start) * 1000
+
+                if mode == "only_edge":
+                    postprocess_ms = 0.0
+                else:
+                    _post_start = time.perf_counter()
+                    results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
+                    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                    self._update_map(results, batch_id, batch_size, map_results=map_results)
+                    postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
                 batch_end = time.perf_counter()
                 with open(self._timing_log_cloud, "a") as _tf:
@@ -481,8 +574,13 @@ class Scheduler:
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
+                _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
+                ram_ms = (time.perf_counter() - _ram_start) * 1000
 
+                self._send_ram_report(received_message_size / (1024 * 1024))
+
+                _write_start = time.perf_counter()
                 self.write_metrics(
                     mode=mode,
                     role="cloud",
@@ -495,6 +593,16 @@ class Scheduler:
                     message_size_bytes=received_message_size,
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_time,
+                )
+                write_ms = (time.perf_counter() - _write_start) * 1000
+
+                batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
+                Log.print_with_color(
+                    f"[Timing][cloud] gap={gap_ms:.1f}ms decode={decode_ms:.1f}ms "
+                    f"inference={inference_ms:.1f}ms postprocess={postprocess_ms:.1f}ms "
+                    f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
+                    f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
+                    "magenta"
                 )
 
                 batch_id += 1
@@ -528,8 +636,11 @@ class Scheduler:
     def _pivot_and_save(self):
         import glob as _glob
 
-        lock_path = "metrics_pivot.lock"
-        out_path = "metrics_pivoted.csv"
+        # Namespaced theo intermediate_queue: mỗi cluster Hungarian (intermediate_queue_k)
+        # pivot độc lập, không xóa/ghi đè file của cluster khác chạy chung thư mục.
+        lock_path = f"metrics_pivot_{self.intermediate_queue}.lock"
+        out_path = f"metrics_pivoted_{self.intermediate_queue}.csv"
+        raw_glob = f"metrics_raw_{self.intermediate_queue}_*.csv"
 
         # Chỉ 1 client thắng lock mới làm pivot (atomic exclusive create)
         try:
@@ -564,7 +675,7 @@ class Scheduler:
         edge_seq_counter = 0
         cloud_seq_counter = 0
 
-        for fpath in sorted(_glob.glob("metrics_raw_*.csv")):
+        for fpath in sorted(_glob.glob(raw_glob)):
             with open(fpath, newline="") as f:
                 rows_in_file = list(csv.DictReader(f))
             if not rows_in_file:
@@ -632,7 +743,7 @@ class Scheduler:
                     "e2e_latency_ms":          c.get("e2e_latency_ms") or e.get("e2e_latency_ms", ""),
                 })
 
-        for fpath in _glob.glob("metrics_raw_*.csv"):
+        for fpath in _glob.glob(raw_glob):
             try:
                 os.remove(fpath)
             except FileNotFoundError:
@@ -682,21 +793,19 @@ class Scheduler:
         print(f"  [E2E]   latency={avg(all_rows,'e2e_latency_ms',True)} ms")
         print(f"  [SYSTEM TOTAL FPS] {system_fps} fps  (sum of avg fps across {len(set(r.get('device_seq') for r in final_rows))} final device(s))")
         print("=" * 50)
-        Log.print_with_color(f"Saved metrics_pivoted.csv ({n_rows} batches)", "green")
+        Log.print_with_color(f"Saved {out_path} ({n_rows} batches)", "green")
         n_edge_devices = len(set(r.get("device_seq") for r in edge_rows))
         if n_edge_devices > 1:
             Log.print_with_color(
                 f"[mAP] Skipped: {n_edge_devices} edge devices in this cluster — "
                 f"frame alignment undefined for multi-edge mAP.", "yellow")
-        else:
+        elif self._map_updated:
             self._print_map()
 
         if self._det_results:
             self._write_detections_json()
 
     def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
-        if os.path.exists("detections_stream.jsonl"):
-            os.remove("detections_stream.jsonl")
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False)
@@ -705,7 +814,8 @@ class Scheduler:
             try:
                 self.first_layer(model, data, batch_size, splits, logger, compress, mode, save_set)
             except Exception as e:
-                Log.print_with_color(f"[!] Error during inference: {e} — saving metrics anyway.", "yellow")
+                Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
+                traceback.print_exc()
             if mode == "only_edge":
                 self._pivot_and_save()
         elif self.layer_id == num_layers:
@@ -713,7 +823,8 @@ class Scheduler:
             try:
                 self.last_layer(model, batch_size, splits, logger, compress, mode, save_set)
             except Exception as e:
-                Log.print_with_color(f"[!] Error during inference: {e} — saving metrics anyway.", "yellow")
+                Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
+                traceback.print_exc()
             self._pivot_and_save()
         else:
             self.middle_layer(model)

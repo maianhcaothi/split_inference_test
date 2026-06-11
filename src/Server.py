@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import sys
+import glob
 import base64
 import pika
 import pickle
@@ -20,6 +21,22 @@ from src.Clustering import (
 
 class Server:
     def __init__(self, config):
+        # One-time cleanup of shared metrics/lock files from a previous run.
+        # Must happen here (server starts once) — doing this in each Scheduler
+        # caused later-starting clients to wipe out files already being
+        # written by clients that started earlier.
+        for f in (
+            glob.glob("metrics_raw_*.csv")
+            + glob.glob("metrics_pivoted_*.csv")
+            + glob.glob("metrics_pivot_*.lock")
+            + ["detections_stream.jsonl"]
+        ):
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except PermissionError:
+                    src.Log.print_with_color(f"[!] Cannot delete {f} (file is open). Close it and retry.", "red")
+
         self.config = config
         self.address = config["rabbit"]["address"]
         self.username = config["rabbit"]["username"]
@@ -55,11 +72,8 @@ class Server:
         self.client_profile_data = {}   # {client_id_str: np.array of per-layer times}
         self.client_bandwidth_data = {} # {client_id_str: float MB/s}
         self.client_name_data = {}      # {client_id_str: str name}
-        self._ram_paused = False
-        self._monitor_queues = []
-        self._edge_control_queues = []
-        self._QUEUE_HIGH = 10  # updated in _start_queue_monitor based on num edges
-        self._QUEUE_LOW  = 3
+        self._queue_state = {}  # queue_name -> {"edge_control_queues":[...], "high":10, "low":3, "paused":False, "cloud_max_queue":{}}
+        self._stopping = False
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
@@ -128,10 +142,21 @@ class Server:
             client_id = message["client_id"]
             self.send_to_response(str(client_id), pickle.dumps({"action": "BW_ACK"}))
 
+        elif action == "RAM_REPORT":
+            client_id = message["client_id"]
+            queue_name = message["queue_name"]
+            max_queue = message["max_queue"]
+            state = self._queue_state.get(queue_name)
+            if state is not None:
+                state["cloud_max_queue"][str(client_id)] = max_queue
+                state["high"] = max(1, min(state["cloud_max_queue"].values()))
+                state["low"]  = max(1, state["high"] // 4)
+
         elif action == "NOTIFY":
             self.count_clients += 1
             if self.count_clients == self.total_clients[0]:
                 self.logger.log_info("Stop Inference !!!")
+                self._stopping = True
                 self.notify_clients(start=False)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 self.channel.stop_consuming()
@@ -229,46 +254,54 @@ class Server:
         return solver, result
 
     def _start_queue_monitor(self, clients_to_notify):
-        mode = self._get_mode()
-        if mode not in ("split", None, ""):
-            return
         queue_names = set(
             self.client_assignments.get(cid, {}).get("queue_name", "intermediate_queue")
             for cid, lid in clients_to_notify if lid == 1
         ) or {"intermediate_queue"}
-        self._monitor_queues = list(queue_names)
-        self._edge_control_queues = [
-            f"control_{str(cid).replace('-', '')[:12]}"
-            for cid, lid in clients_to_notify if lid == 1
-        ]
-        n_edge = len(self._edge_control_queues)
-        self._QUEUE_HIGH = max(10, n_edge * 2)
-        self._QUEUE_LOW  = max(3,  n_edge)
-        src.Log.print_with_color(
-            f"[BackPressure] Monitor {len(self._monitor_queues)} queue(s), "
-            f"{n_edge} edge(s), HIGH={self._QUEUE_HIGH}, LOW={self._QUEUE_LOW}", "cyan")
+
+        self._queue_state = {}
+        for qname in queue_names:
+            edges = [
+                f"control_{str(cid).replace('-', '')[:12]}"
+                for cid, lid in clients_to_notify if lid == 1
+                and self.client_assignments.get(cid, {}).get("queue_name", "intermediate_queue") == qname
+            ]
+            self._queue_state[qname] = {
+                "edge_control_queues": edges,
+                "high": 10,
+                "low": 3,
+                "paused": False,
+                "cloud_max_queue": {},
+            }
+            src.Log.print_with_color(
+                f"[BackPressure] Monitor queue '{qname}': {len(edges)} edge(s), "
+                f"threshold will be set after first RAM_REPORT", "cyan")
         self.connection.call_later(1.0, self._check_queue_depth)
 
     def _check_queue_depth(self):
-        try:
-            total = sum(
-                self.reply_channel.queue_declare(q, passive=True).method.message_count
-                for q in self._monitor_queues
-            )
-            if total > self._QUEUE_HIGH and not self._ram_paused:
-                src.Log.print_with_color(f"[BackPressure] depth={total} > {self._QUEUE_HIGH}, PAUSE edges", "yellow")
-                for ctrl_q in self._edge_control_queues:
-                    self.reply_channel.queue_declare(ctrl_q, durable=False)
-                    self.reply_channel.basic_publish('', ctrl_q, pickle.dumps({"action": "PAUSE"}))
-                self._ram_paused = True
-            elif total <= self._QUEUE_LOW and self._ram_paused:
-                src.Log.print_with_color(f"[BackPressure] depth={total} <= {self._QUEUE_LOW}, RESUME edges", "green")
-                for ctrl_q in self._edge_control_queues:
-                    self.reply_channel.queue_declare(ctrl_q, durable=False)
-                    self.reply_channel.basic_publish('', ctrl_q, pickle.dumps({"action": "RESUME"}))
-                self._ram_paused = False
-        except Exception:
-            pass
+        if self._stopping:
+            return
+        for qname, state in self._queue_state.items():
+            try:
+                if not self.reply_channel.is_open:
+                    self.reply_channel = self.connection.channel()
+                depth = self.reply_channel.queue_declare(qname, passive=True).method.message_count
+                if depth > state["high"] and not state["paused"]:
+                    src.Log.print_with_color(
+                        f"[BackPressure] '{qname}' depth={depth} > {state['high']}, PAUSE edges", "yellow")
+                    for ctrl_q in state["edge_control_queues"]:
+                        self.reply_channel.queue_declare(ctrl_q, durable=False)
+                        self.reply_channel.basic_publish('', ctrl_q, pickle.dumps({"action": "PAUSE"}))
+                    state["paused"] = True
+                elif depth <= state["low"] and state["paused"]:
+                    src.Log.print_with_color(
+                        f"[BackPressure] '{qname}' depth={depth} <= {state['low']}, RESUME edges", "green")
+                    for ctrl_q in state["edge_control_queues"]:
+                        self.reply_channel.queue_declare(ctrl_q, durable=False)
+                        self.reply_channel.basic_publish('', ctrl_q, pickle.dumps({"action": "RESUME"}))
+                    state["paused"] = False
+            except Exception:
+                continue
         self.connection.call_later(1.0, self._check_queue_depth)
 
     def notify_clients(self, start=True):

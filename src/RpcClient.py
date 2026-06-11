@@ -78,13 +78,6 @@ class RpcClient:
                 else:
                     client = layers[splits:]
 
-            if mode == "only_edge" and self.layer_id != 1:
-                Log.print_with_color(
-                    "[Benchmark] only_edge mode: cloud client idle, skip inference",
-                    "yellow"
-                )
-                return False
-
             Log.print_with_color(f"Start Inference", "green")
 
             self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set)

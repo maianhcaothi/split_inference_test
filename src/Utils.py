@@ -1,5 +1,6 @@
 import pika
 from requests.auth import HTTPBasicAuth
+from urllib.parse import quote
 import requests
 import os
 import numpy as np
@@ -7,7 +8,7 @@ import cv2
 
 
 def delete_old_queues(address, username, password, virtual_host):
-    url = f'http://{address}:15672/api/queues'
+    url = f'http://{address}:15672/api/queues/{quote(virtual_host, safe="")}'
     response = requests.get(url, auth=HTTPBasicAuth(username, password))
 
     if response.status_code == 200:

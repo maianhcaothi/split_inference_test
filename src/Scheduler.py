@@ -269,8 +269,9 @@ class Scheduler:
 
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
-        model.eval()
-        model.to(self.device)
+        if mode != "only_cloud":
+            model.eval()
+            model.to(self.device)
 
         video_path = data
         cap = cv2.VideoCapture(video_path)
@@ -323,7 +324,11 @@ class Scheduler:
                     }
 
                     _wait_start = time.perf_counter()
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
                     self._check_control_queue()
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
@@ -348,7 +353,11 @@ class Scheduler:
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                     _wait_start = time.perf_counter()
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
                     self._check_control_queue()
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
@@ -383,7 +392,11 @@ class Scheduler:
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
                     _wait_start = time.perf_counter()
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
                     self._check_control_queue()
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     y = {

@@ -5,6 +5,7 @@ import glob
 import base64
 import pika
 import pickle
+import psutil
 import src.Model
 import src.Log
 from ultralytics import YOLO
@@ -17,6 +18,8 @@ from src.Clustering import (
     get_cut_data_sizes,
     get_raw_input_mb,
 )
+
+RAM_SAFETY_FACTOR = 0.5  # only use up to 50% of available RAM (on this server's machine) for queue buffering
 
 
 class Server:
@@ -72,7 +75,7 @@ class Server:
         self.client_profile_data = {}   # {client_id_str: np.array of per-layer times}
         self.client_bandwidth_data = {} # {client_id_str: float MB/s}
         self.client_name_data = {}      # {client_id_str: str name}
-        self._queue_state = {}  # queue_name -> {"edge_control_queues":[...], "high":10, "low":3, "paused":False, "cloud_max_queue":{}}
+        self._queue_state = {}  # queue_name -> {"edge_control_queues":[...], "high":10, "cloud_msg_mb":{}}
         self._stopping = False
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
@@ -145,12 +148,21 @@ class Server:
         elif action == "RAM_REPORT":
             client_id = message["client_id"]
             queue_name = message["queue_name"]
-            max_queue = message["max_queue"]
+            msg_mb = message["msg_mb"]
             state = self._queue_state.get(queue_name)
             if state is not None:
-                state["cloud_max_queue"][str(client_id)] = max_queue
-                state["high"] = max(1, min(state["cloud_max_queue"].values()))
-                state["low"]  = max(1, state["high"] // 4)
+                state["cloud_msg_mb"][str(client_id)] = msg_mb
+                available_mb = psutil.virtual_memory().available / (1024 * 1024)
+                worst_msg_mb = max(state["cloud_msg_mb"].values())
+                total_edges = sum(max(s["n_edges"], 1) for s in self._queue_state.values())
+                per_queue_mb = available_mb * (max(state["n_edges"], 1) / total_edges)
+                state["high"] = max(1, int((per_queue_mb * RAM_SAFETY_FACTOR) / max(worst_msg_mb, 1e-6)))
+                for ctrl_q in state["edge_control_queues"]:
+                    self.channel.queue_declare(ctrl_q, durable=False)
+                    self.channel.basic_publish('', ctrl_q, pickle.dumps({"action": "MAX_QUEUE", "value": state["high"]}))
+                src.Log.print_with_color(
+                    f"[BackPressure] '{queue_name}' max_queue={state['high']} "
+                    f"(available_mb={available_mb:.1f}, per_queue_mb={per_queue_mb:.1f}, msg_mb={worst_msg_mb:.2f})", "cyan")
 
         elif action == "NOTIFY":
             self.count_clients += 1
@@ -268,41 +280,13 @@ class Server:
             ]
             self._queue_state[qname] = {
                 "edge_control_queues": edges,
+                "n_edges": len(edges),
                 "high": 10,
-                "low": 3,
-                "paused": False,
-                "cloud_max_queue": {},
+                "cloud_msg_mb": {},
             }
             src.Log.print_with_color(
                 f"[BackPressure] Monitor queue '{qname}': {len(edges)} edge(s), "
-                f"threshold will be set after first RAM_REPORT", "cyan")
-        self.connection.call_later(1.0, self._check_queue_depth)
-
-    def _check_queue_depth(self):
-        if self._stopping:
-            return
-        for qname, state in self._queue_state.items():
-            try:
-                if not self.reply_channel.is_open:
-                    self.reply_channel = self.connection.channel()
-                depth = self.reply_channel.queue_declare(qname, passive=True).method.message_count
-                if depth > state["high"] and not state["paused"]:
-                    src.Log.print_with_color(
-                        f"[BackPressure] '{qname}' depth={depth} > {state['high']}, PAUSE edges", "yellow")
-                    for ctrl_q in state["edge_control_queues"]:
-                        self.reply_channel.queue_declare(ctrl_q, durable=False)
-                        self.reply_channel.basic_publish('', ctrl_q, pickle.dumps({"action": "PAUSE"}))
-                    state["paused"] = True
-                elif depth <= state["low"] and state["paused"]:
-                    src.Log.print_with_color(
-                        f"[BackPressure] '{qname}' depth={depth} <= {state['low']}, RESUME edges", "green")
-                    for ctrl_q in state["edge_control_queues"]:
-                        self.reply_channel.queue_declare(ctrl_q, durable=False)
-                        self.reply_channel.basic_publish('', ctrl_q, pickle.dumps({"action": "RESUME"}))
-                    state["paused"] = False
-            except Exception:
-                continue
-        self.connection.call_later(1.0, self._check_queue_depth)
+                f"max_queue will be set after first RAM_REPORT", "cyan")
 
     def notify_clients(self, start=True):
         if start:

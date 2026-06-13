@@ -13,8 +13,8 @@ from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
 
-RAM_SAFETY_FACTOR = 0.5  # only use up to 50% of available RAM for queue buffering
 RAW_FRAME_MB = 3 * 640 * 640 * 4 / (1024 * 1024)  # uncompressed float32 640x640x3 frame, ~4.69MB
+RESULT_MSG_MB = 0.1  # only_edge: estimated size of a batch of detection results (boxes/scores/classes)
 
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
@@ -34,7 +34,7 @@ class Scheduler:
                     pass
 
         self._control_queue = f"control_{cid_short}"
-        self._server_paused = False
+        self._max_queue = 10  # overwritten by MAX_QUEUE updates from the server
         self.channel.queue_declare(self._control_queue, durable=False)
 
         self.size_message = None
@@ -63,46 +63,41 @@ class Scheduler:
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
 
-    def get_available_ram_mb(self):
-        return psutil.virtual_memory().available / (1024 * 1024)
-
     def _send_ram_report(self, msg_mb):
-        available_mb = self.get_available_ram_mb()
-        max_queue = max(1, int((available_mb * RAM_SAFETY_FACTOR) / max(msg_mb, 1e-6)))
         self.send_to_server({
             "action": "RAM_REPORT",
             "client_id": self.client_id,
             "queue_name": self.intermediate_queue,
-            "max_queue": max_queue,
+            "msg_mb": msg_mb,
         })
 
-    def _check_control_queue(self):
+    def _drain_control_queue(self):
         while True:
             method, _, body = self.channel.basic_get(self._control_queue, auto_ack=True)
             if method is None:
                 break
             try:
                 msg = pickle.loads(body)
-                action = msg.get("action")
-                if action == "PAUSE":
-                    self._server_paused = True
-                    Log.print_with_color("[BackPressure] PAUSE received from server", "yellow")
-                elif action == "RESUME":
-                    self._server_paused = False
+                if msg.get("action") == "MAX_QUEUE":
+                    self._max_queue = msg["value"]
             except Exception:
                 pass
 
-        while self._server_paused:
-            time.sleep(0.5)
-            method, _, body = self.channel.basic_get(self._control_queue, auto_ack=True)
-            if method is not None:
-                try:
-                    msg = pickle.loads(body)
-                    if msg.get("action") == "RESUME":
-                        self._server_paused = False
-                        Log.print_with_color("[BackPressure] RESUME received, resuming", "green")
-                except Exception:
-                    pass
+    def _check_control_queue(self):
+        self._drain_control_queue()
+
+        depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
+        if depth < self._max_queue:
+            return
+
+        Log.print_with_color(
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={self._max_queue}, waiting", "yellow")
+        while depth >= self._max_queue:
+            time.sleep(0.1)
+            self._drain_control_queue()
+            depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
+        Log.print_with_color(
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={self._max_queue}, resuming", "green")
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -306,7 +301,10 @@ class Scheduler:
 
                 _stack_start = time.perf_counter()
                 input_image = torch.stack(input_image)
-                input_image = input_image.to(self.device)
+                if mode != "only_cloud":
+                    # only_cloud: edge does no GPU inference, keep frames on CPU
+                    # to avoid a wasted CPU->GPU->CPU round trip before sending.
+                    input_image = input_image.to(self.device)
                 stack_ms = (time.perf_counter() - _stack_start) * 1000
 
                 inference_ms = 0.0
@@ -315,7 +313,7 @@ class Scheduler:
 
                 # ===== ONLY CLOUD =====
                 if mode == "only_cloud":
-                    frames_cpu = input_image.cpu()
+                    frames_cpu = input_image
                     y = {
                         "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
                         "width": width,
@@ -361,9 +359,7 @@ class Scheduler:
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
-                    frames_cpu = input_image.cpu()
                     payload = {
-                        "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
                         "width": width,
                         "height": height,
                         "results": [
@@ -500,13 +496,15 @@ class Scheduler:
             model.eval()
             model.to(self.device)
 
-        self.channel.basic_qos(prefetch_count=10)
-
         # Báo RAM ngay từ đầu (trước khi nhận batch nào) để server có ngưỡng
         # dựa trên RAM thực tế thay vì dùng default HIGH=10/LOW=3.
-        # Ước lượng msg_mb bằng kích thước frame thô chưa nén (worst-case cho
-        # only_cloud/only_edge, conservative cho split vì feature map thường nhỏ hơn).
-        self._send_ram_report(RAW_FRAME_MB * batch_size)
+        # only_edge: message chỉ chứa results (boxes/scores/classes), rất nhẹ.
+        # only_cloud/split: message chứa frame thô/feature map, dùng RAW_FRAME_MB
+        # làm ước lượng worst-case (conservative cho split vì feature map thường nhỏ hơn).
+        if mode == "only_edge":
+            self._send_ram_report(RESULT_MSG_MB)
+        else:
+            self._send_ram_report(RAW_FRAME_MB * batch_size)
 
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0

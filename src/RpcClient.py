@@ -56,27 +56,32 @@ class RpcClient:
             else:
                 Log.print_with_color(f"Can't load model.", "yellow")
 
-            ckpt = torch.load(f"{model_name}.pt", map_location=self.device, weights_only=False)
-            model = ckpt["model"].to(self.device)
-            model = model.float()
-            layers = model.model
-            save_set = get_save_set(layers)  # None → yolo26 fallback, set → dynamic routing
-            if mode == "only_edge":
-                if self.layer_id == 1:
-                    client = layers
-                else:
-                    client = None
-
-
-            elif mode == "only_cloud":
-
-                client = layers
-
+            # only_edge cloud / only_cloud edge don't run any model on this
+            # device at all — skip loading the checkpoint onto the device
+            # entirely instead of loading it and immediately discarding it.
+            if mode == "only_edge" and self.layer_id != 1:
+                needs_model = False
+            elif mode == "only_cloud" and self.layer_id == 1:
+                needs_model = False
             else:
-                if self.layer_id == 1:
+                needs_model = True
+
+            if needs_model:
+                ckpt = torch.load(f"{model_name}.pt", map_location=self.device, weights_only=False)
+                model = ckpt["model"].to(self.device)
+                model = model.float()
+                layers = model.model
+                save_set = get_save_set(layers)  # None → yolo26 fallback, set → dynamic routing
+
+                if mode in ("only_edge", "only_cloud"):
+                    client = layers
+                elif self.layer_id == 1:
                     client = layers[:splits]
                 else:
                     client = layers[splits:]
+            else:
+                client = None
+                save_set = None
 
             Log.print_with_color(f"Start Inference", "green")
 

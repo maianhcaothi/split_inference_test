@@ -20,6 +20,7 @@ from src.Clustering import (
 )
 
 RAM_SAFETY_FACTOR = 0.5  # only use up to 50% of available RAM (on this server's machine) for queue buffering
+RAM_RESERVE_MB = 1024  # absolute floor always left for OS/RabbitMQ overhead, before applying RAM_SAFETY_FACTOR
 
 
 class Server:
@@ -153,16 +154,17 @@ class Server:
             if state is not None:
                 state["cloud_msg_mb"][str(client_id)] = msg_mb
                 available_mb = psutil.virtual_memory().available / (1024 * 1024)
+                usable_mb = max(0.0, available_mb - RAM_RESERVE_MB)
                 worst_msg_mb = max(state["cloud_msg_mb"].values())
                 total_edges = sum(max(s["n_edges"], 1) for s in self._queue_state.values())
-                per_queue_mb = available_mb * (max(state["n_edges"], 1) / total_edges)
+                per_queue_mb = usable_mb * (max(state["n_edges"], 1) / total_edges)
                 state["high"] = max(1, int((per_queue_mb * RAM_SAFETY_FACTOR) / max(worst_msg_mb, 1e-6)))
                 for ctrl_q in state["edge_control_queues"]:
                     self.channel.queue_declare(ctrl_q, durable=False)
                     self.channel.basic_publish('', ctrl_q, pickle.dumps({"action": "MAX_QUEUE", "value": state["high"]}))
                 src.Log.print_with_color(
                     f"[BackPressure] '{queue_name}' max_queue={state['high']} "
-                    f"(available_mb={available_mb:.1f}, per_queue_mb={per_queue_mb:.1f}, msg_mb={worst_msg_mb:.2f})", "cyan")
+                    f"(available_mb={available_mb:.1f}, usable_mb={usable_mb:.1f}, per_queue_mb={per_queue_mb:.1f}, msg_mb={worst_msg_mb:.2f})", "cyan")
 
         elif action == "NOTIFY":
             self.count_clients += 1

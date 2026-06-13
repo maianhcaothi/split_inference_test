@@ -14,7 +14,11 @@ import src.Log as Log
 from src.Model import inference, postprocess_yolo
 
 # Fixed cap on intermediate_queue depth (messages) before an edge waits.
-MAX_QUEUE = 20
+# Only only_cloud sends large raw frames (~150MB/msg), which can blow up
+# RabbitMQ broker memory on the Hub if too many pile up. split/Hungarian
+# sends small compressed feature maps and has never overflowed, so it's
+# left unconstrained.
+MAX_QUEUE_ONLY_CLOUD = 20
 
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
@@ -60,17 +64,18 @@ class Scheduler:
         return process.memory_info().rss / (1024 * 1024)
 
     def _check_backpressure(self):
+        max_queue = MAX_QUEUE_ONLY_CLOUD
         depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
-        if depth < MAX_QUEUE:
+        if depth < max_queue:
             return
 
         Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={MAX_QUEUE}, waiting", "yellow")
-        while depth >= MAX_QUEUE:
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={max_queue}, waiting", "yellow")
+        while depth >= max_queue:
             time.sleep(0.1)
             depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={MAX_QUEUE}, resuming", "green")
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={max_queue}, resuming", "green")
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -323,14 +328,6 @@ class Scheduler:
                     map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
 
-                    _wait_start = time.perf_counter()
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_backpressure()
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
-                    queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
-
                     _send_start = time.perf_counter()
                     payload = {
                         "width": width,
@@ -359,14 +356,6 @@ class Scheduler:
                         x, y = inference(model, input_image, y, 0, save_set)
                     y[-1] = x
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
-
-                    _wait_start = time.perf_counter()
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_backpressure()
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
-                    queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     y = {
                         "data": y,

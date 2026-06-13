@@ -74,7 +74,7 @@ def profile_or_load(model_name: str, model, device: str,
         dummy = torch.randn(batch_size, 3, 640, 640).to(device)
 
     # Warmup + Benchmark
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(warmup + runs):
             _profile_model(dummy)
             if is_cuda:
@@ -117,11 +117,14 @@ def measure_bandwidth(channel, client_id: str,
     timeout_s = 30.0
     samples = []
     for _ in range(runs):
-        message = pickle.dumps({
-            "action": "BW_TEST",
-            "client_id": client_id,
-            "payload": payload,
-        })
+        message = pickle.dumps(
+            {
+                "action": "BW_TEST",
+                "client_id": client_id,
+                "payload": payload,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
         t_start = time.perf_counter()
         channel.basic_publish(exchange='', routing_key='rpc_queue', body=message)
 

@@ -9,9 +9,17 @@ import os
 import psutil
 import numpy as np
 
-from src.Compress import Encoder,Decoder
+from src.Compress import Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
+from src.Transport import (
+    CompletedPublishFuture,
+    PublishReceipt,
+    RabbitAsyncPublisher,
+    declare_intermediate_queue,
+    prepare_intermediate_message,
+    transport_config,
+)
 
 # Fixed cap on intermediate_queue depth (messages) before an edge waits.
 # Only only_cloud sends large raw frames (~150MB/msg), which can blow up
@@ -21,11 +29,16 @@ from src.Model import inference, postprocess_yolo
 MAX_QUEUE_ONLY_CLOUD = 15
 
 class Scheduler:
-    def __init__(self, client_id, layer_id, channel, device):
+    def __init__(self, client_id, layer_id, channel, device, rabbit_config=None, transport=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
         self.device = device
+        self.rabbit_config = rabbit_config
+        self.transport = transport_config(transport)
+        self.publisher = None
+        if self.transport["async_publish"] and self.rabbit_config is not None and self.layer_id == 1:
+            self.publisher = RabbitAsyncPublisher(self.rabbit_config, self.transport)
 
         cid_short = str(client_id).replace('-', '')[:12]
         self._timing_log_edge  = f"timing_edge_{cid_short}.log"
@@ -39,13 +52,18 @@ class Scheduler:
 
         self.size_message = None
         self.intermediate_queue = f"intermediate_queue"
-        self.channel.queue_declare(self.intermediate_queue, durable=False)
+        declare_intermediate_queue(self.channel, self.intermediate_queue, self.transport)
+        try:
+            self.channel.basic_qos(prefetch_count=max(1, self.transport["consumer_prefetch"]))
+        except Exception:
+            pass
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
         self.map_metric = None
         self.gt_dict = {}
         self._det_results = {}
         self._map_updated = False
+        self._last_unacked_delivery_tag = None
         self._load_gt_dict()
 
     def get_ram_mb(self):
@@ -64,18 +82,24 @@ class Scheduler:
         return process.memory_info().rss / (1024 * 1024)
 
     def _check_backpressure(self):
-        max_queue = MAX_QUEUE_ONLY_CLOUD
+        max_queue = self.transport.get("backpressure_high_watermark", MAX_QUEUE_ONLY_CLOUD)
+        low_watermark = self.transport.get("backpressure_low_watermark", max_queue // 2)
+        poll_sec = self.transport.get("backpressure_poll_sec", 0.1)
+        if max_queue <= 0:
+            return 0.0
+        wait_start = time.perf_counter()
         depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         if depth < max_queue:
-            return
+            return 0.0
 
         Log.print_with_color(
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={max_queue}, waiting", "yellow")
-        while depth >= max_queue:
-            time.sleep(0.1)
+        while depth > low_watermark:
+            time.sleep(poll_sec)
             depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={max_queue}, resuming", "green")
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} <= low_watermark={low_watermark}, resuming", "green")
+        return (time.perf_counter() - wait_start) * 1000
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -128,28 +152,45 @@ class Scheduler:
             self._my_metrics_queue = None
 
     def send_next_layer(self, intermediate_queue, data, compress):
+        if self.publisher is not None:
+            return self.publisher.submit(intermediate_queue, data, compress)
 
-        if compress["enable"]:
-            data["data"] = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None for t in
-                                     data["data"]]
-            data["data"], data["shape"] = Encoder(data_output=data["data"], num_bits=compress["num_bit"])
-
-        else:
-            data["data"] = [t.cpu() if isinstance(t, torch.Tensor) else None for t in
-                                     data["data"]]
-        message = pickle.dumps({
-            "action": "OUTPUT",
-            "data": data
-        })
-        self.size_message = len(message)
-
-
-        self.channel.basic_publish(
-            exchange='',
-            routing_key=intermediate_queue,
-            body=message,
-            #body= "."
+        message, size_bytes, prepare_ms = prepare_intermediate_message(data, compress)
+        remote_wait_ms = self._check_backpressure()
+        publish_start = time.perf_counter()
+        self.channel.basic_publish(exchange='', routing_key=intermediate_queue, body=message)
+        publish_ms = (time.perf_counter() - publish_start) * 1000
+        self.size_message = size_bytes
+        return CompletedPublishFuture(
+            PublishReceipt(
+                size_bytes=size_bytes,
+                prepare_ms=prepare_ms,
+                remote_wait_ms=remote_wait_ms,
+                publish_ms=publish_ms,
+                completed_perf=time.perf_counter(),
+            )
         )
+
+    def _drain_edge_publish_metrics(self, pending, block=False):
+        remaining = []
+        for future, metric_kwargs in pending:
+            if not block and not future.done():
+                remaining.append((future, metric_kwargs))
+                continue
+            receipt = future.result()
+            self.size_message = receipt.size_bytes
+            metric_kwargs["message_size_bytes"] = receipt.size_bytes
+            batch_start_perf = metric_kwargs.pop("_batch_start_perf", None)
+            if batch_start_perf is not None and receipt.completed_perf:
+                metric_kwargs["latency_ms"] = (receipt.completed_perf - batch_start_perf) * 1000
+            self.write_metrics(**metric_kwargs)
+        return remaining
+
+    def _close_publisher(self):
+        if self.publisher is None:
+            return
+        self.publisher.close()
+        self.publisher = None
 
     def _load_gt_dict(self, gt_dir="datasets/groundtruth"):
         if not os.path.isdir(gt_dir):
@@ -238,7 +279,7 @@ class Scheduler:
         self.channel.queue_declare('rpc_queue', durable=False)
         self.channel.basic_publish(exchange='',
                                    routing_key='rpc_queue',
-                                   body=pickle.dumps(message))
+                                   body=pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
 
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
@@ -258,6 +299,7 @@ class Scheduler:
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+        pending_edge_metrics = []
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
@@ -265,8 +307,11 @@ class Scheduler:
             if not ret:
                 break
             frame = cv2.resize(frame, (640, 640))
-            frame = frame.astype('float32') / 255.0
-            tensor = torch.from_numpy(frame).permute(2, 0, 1)  # shape: (3, 640, 640)
+            if mode == "only_cloud":
+                tensor = torch.from_numpy(frame).permute(2, 0, 1).contiguous()
+            else:
+                frame = frame.astype('float32') / 255.0
+                tensor = torch.from_numpy(frame).permute(2, 0, 1).contiguous()  # shape: (3, 640, 640)
             input_image.append(tensor)
 
             if len(input_image) == batch_size:
@@ -282,7 +327,7 @@ class Scheduler:
                 if mode != "only_cloud":
                     # only_cloud: edge does no GPU inference, keep frames on CPU
                     # to avoid a wasted CPU->GPU->CPU round trip before sending.
-                    input_image = input_image.to(self.device)
+                    input_image = input_image.to(self.device, non_blocking=True)
                 stack_ms = (time.perf_counter() - _stack_start) * 1000
 
                 inference_ms = 0.0
@@ -302,25 +347,25 @@ class Scheduler:
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_backpressure()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
-                    self.send_next_layer(
+                    publish_future = self.send_next_layer(
                         self.intermediate_queue,
                         y,
                         {"enable": False}
                     )
                     send_ms = (time.perf_counter() - _send_start) * 1000
+                    queue_wait_ms += getattr(publish_future, "local_wait_ms", 0.0)
 
                 # ===== ONLY EDGE =====
                 elif mode == "only_edge":
 
                     _inf_start = time.perf_counter()
                     y = []
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         x, y = inference(model, input_image, y, 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
@@ -342,17 +387,16 @@ class Scheduler:
                         ],
                         "edge_start_time": edge_start_wall,
                     }
-                    body = pickle.dumps({"action": "OUTPUT", "data": payload})
-                    self.size_message = len(body)
-                    self.channel.basic_publish(exchange='', routing_key=self.intermediate_queue, body=body)
+                    publish_future = self.send_next_layer(self.intermediate_queue, payload, {"enable": False})
                     send_ms = (time.perf_counter() - _send_start) * 1000
+                    queue_wait_ms += getattr(publish_future, "local_wait_ms", 0.0)
 
                 # ===== SPLIT INFERENCE =====
                 else:
 
                     _inf_start = time.perf_counter()
                     y = []
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         x, y = inference(model, input_image, y, 0, save_set)
                     y[-1] = x
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
@@ -365,10 +409,11 @@ class Scheduler:
                     }
 
                     _send_start = time.perf_counter()
-                    self.send_next_layer(
+                    publish_future = self.send_next_layer(
                         self.intermediate_queue,y,compress
                     )
                     send_ms = (time.perf_counter() - _send_start) * 1000
+                    queue_wait_ms += getattr(publish_future, "local_wait_ms", 0.0)
                 batch_end = time.perf_counter()
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(time.time_ns()) + " output", file=_tf)
@@ -378,22 +423,23 @@ class Scheduler:
                 _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
-                msg_size = self.size_message if self.size_message is not None else 0
-
+                metric_kwargs = {
+                    "mode": mode,
+                    "role": "edge_sender" if mode == "only_cloud" else "edge",
+                    "best_cut": "N/A" if splits is None else splits,
+                    "batch_id": batch_id,
+                    "batch_size": batch_size,
+                    "latency_ms": latency_ms,
+                    "fps": fps,
+                    "ram_mb": ram_mb,
+                    "message_size_bytes": 0,
+                    "e2e_latency_ms": e2e_latency_ms,
+                    "edge_start_time": edge_start_wall,
+                    "_batch_start_perf": batch_start,
+                }
+                pending_edge_metrics.append((publish_future, metric_kwargs))
                 _write_start = time.perf_counter()
-                self.write_metrics(
-                    mode=mode,
-                    role="edge_sender" if mode == "only_cloud" else "edge",
-                    best_cut="N/A" if splits is None else splits,
-                    batch_id=batch_id,
-                    batch_size=batch_size,
-                    latency_ms=latency_ms,
-                    fps=fps,
-                    ram_mb=ram_mb,
-                    message_size_bytes=msg_size,
-                    e2e_latency_ms=e2e_latency_ms,
-                    edge_start_time=edge_start_wall,
-                )
+                pending_edge_metrics = self._drain_edge_publish_metrics(pending_edge_metrics, block=False)
                 write_ms = (time.perf_counter() - _write_start) * 1000
 
                 batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
@@ -412,6 +458,8 @@ class Scheduler:
                 pbar.update(batch_size)
             else:
                 continue
+        pending_edge_metrics = self._drain_edge_publish_metrics(pending_edge_metrics, block=True)
+        self._close_publisher()
         with open(self._timing_log_edge, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
         print(f'size message: {self.size_message} bytes.')
@@ -429,7 +477,10 @@ class Scheduler:
                 self.channel.basic_publish(
                     exchange=exchange,
                     routing_key='',
-                    body=pickle.dumps({"action": "METRICS", "filename": os.path.basename(metrics_file), "data": metrics_data})
+                    body=pickle.dumps(
+                        {"action": "METRICS", "filename": os.path.basename(metrics_file), "data": metrics_data},
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
                 )
                 Log.print_with_color(f"[Metrics] Broadcast metrics via fanout ({len(metrics_data)} bytes)", "cyan")
             except Exception as e:
@@ -464,8 +515,9 @@ class Scheduler:
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
-            method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
+            method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=False)
             if method_frame and body:
+                self._last_unacked_delivery_tag = method_frame.delivery_tag
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 with open(self._timing_log_cloud, "a") as _tf:
@@ -488,11 +540,15 @@ class Scheduler:
                     if isinstance(input_tensor, list):
                         input_tensor = torch.stack(input_tensor)
 
-                    input_tensor = input_tensor.to(self.device)
+                    input_tensor = input_tensor.to(self.device, non_blocking=True)
+                    if input_tensor.dtype == torch.uint8:
+                        input_tensor = input_tensor.float().div_(255.0)
+                    elif input_tensor.dtype != torch.float32:
+                        input_tensor = input_tensor.float()
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
 
                     _inf_start = time.perf_counter()
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         x, _ = inference(model, input_tensor, [], 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
                 # ===== SPLIT INFERENCE =====
@@ -507,7 +563,7 @@ class Scheduler:
                         ]
 
                     y["data"] = [
-                        t.to(self.device) if t is not None else None
+                        t.to(self.device, non_blocking=True) if t is not None else None
                         for t in y["data"]
                     ]
 
@@ -517,7 +573,7 @@ class Scheduler:
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
 
                     _inf_start = time.perf_counter()
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         x, _ = inference(model, x, list_output, splits, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
@@ -566,6 +622,8 @@ class Scheduler:
                     "magenta"
                 )
 
+                self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                self._last_unacked_delivery_tag = None
                 batch_id += 1
                 prev_batch_end = batch_end
 
@@ -581,7 +639,7 @@ class Scheduler:
                         Log.print_with_color("[>>>] Finish!", "red")
                         break
                 else:
-                    time.sleep(0.5)
+                    time.sleep(self.transport["consumer_poll_sec"])
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
@@ -769,12 +827,13 @@ class Scheduler:
     def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
-            self.channel.queue_declare(self.intermediate_queue, durable=False)
+            declare_intermediate_queue(self.channel, self.intermediate_queue, self.transport)
 
         if self.layer_id == 1:
             try:
                 self.first_layer(model, data, batch_size, splits, logger, compress, mode, save_set)
             except Exception as e:
+                self._close_publisher()
                 Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
                 traceback.print_exc()
             if mode == "only_edge":
@@ -784,6 +843,12 @@ class Scheduler:
             try:
                 self.last_layer(model, batch_size, splits, logger, compress, mode, save_set)
             except Exception as e:
+                if self._last_unacked_delivery_tag is not None:
+                    try:
+                        self.channel.basic_nack(delivery_tag=self._last_unacked_delivery_tag, requeue=True)
+                    except Exception:
+                        pass
+                    self._last_unacked_delivery_tag = None
                 Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
                 traceback.print_exc()
             self._pivot_and_save()

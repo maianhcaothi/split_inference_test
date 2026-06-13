@@ -23,6 +23,19 @@ compress:
   enable: True
   num_bit: 8
 
+transport:
+  async_publish: True
+  local_queue_size: 2
+  rabbit_max_queue_messages: 8
+  rabbit_max_queue_bytes: 0
+  rabbit_overflow: reject-publish
+  backpressure_high_watermark: 6
+  backpressure_low_watermark: 3
+  backpressure_poll_sec: 0.02
+  publish_confirm: True
+  consumer_prefetch: 1
+  consumer_poll_sec: 0.02
+
 clustering:
   enable: True         # True → Hungarian tự chọn cut point; False → dùng cut-layer cố định
   num_A: 3              # num_A + num_B + num_C = clients[0] (tổng edge)

@@ -96,5 +96,5 @@ class RpcClient:
         self.channel.queue_declare('rpc_queue', durable=False)
         self.channel.basic_publish(exchange='',
                                    routing_key='rpc_queue',
-                                   body=pickle.dumps(message))
+                                   body=pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
 

@@ -1,356 +1,384 @@
-# Split Inference
+# Split Inference for YOLO
 
-This project implements **Split Inference for YOLOv11** to enable real-time object detection on low-power **edge devices (Jetson Nano)** by dividing the neural network across multiple machines.
+This project runs YOLO-style object detection as a distributed split-inference
+pipeline. The model is divided into two parts:
 
-Instead of transmitting full video frames, the edge device executes the first part of the model (**head**) and sends only **intermediate feature maps** to another device that runs the remaining layers (**tail**).
+- **Edge/head node**: reads video frames and runs the first part of the model.
+- **Cloud/tail node**: receives intermediate activations and runs the rest of the model.
 
----
+RabbitMQ is used to coordinate clients and transfer intermediate data. The
+pipeline supports feature-map compression, automatic split selection, and
+bounded queue back-pressure so the edge does not overload the cloud receiver.
 
-# Table of Contents
+## Why Split Inference?
 
-* [Overview](#overview)
-* [Architecture](#architecture)
-<!-- * [Data Flow](#data-flow) -->
-* [Pipeline](#pipeline)
-* [Project Structure](#project-structure)
-* [How to Run](#how-to-run)
+Sending full video frames to a cloud server is simple, but it can waste network
+bandwidth and increase latency. Split inference moves the early model layers to
+the edge device and sends only the intermediate tensors needed by the remaining
+layers.
 
-  * [Clone Repository](#1-clone-the-repository)
-  * [Install Dependencies](#2-install-dependencies)
-  * [Start RabbitMQ](#3-start-rabbitmq)
-* [Configuration](#configuration)
-* [Running the System](#running-the-system)
-* [Automatic Partitioning](#automatic-partitioning)
-* [Tested Hardware](#tested-hardware)
-* [Application Scenarios](#application-scenarios)
-* [License](#license)
+Typical use cases:
 
----
+- Jetson Nano or other embedded edge devices.
+- Traffic camera or surveillance workloads.
+- Experiments that compare edge-only, cloud-only, and split execution.
+- Bandwidth and latency measurements for distributed inference.
 
-# Overview
+## Architecture
 
-<p align="center">
-  <img src="imgs/overview.png" width="850">
-</p>
-
-In traditional edge AI pipelines, raw video frames are transmitted to a centralized server for processing. This creates high network bandwidth usage and latency.
-
-**Split inference** solves this by dividing the neural network into two parts:
-
-1. **Head (Edge Device)** – processes the early layers of the model.
-2. **Tail (Server / Cloud)** – processes the remaining layers.
-
-Only **intermediate feature maps** are transmitted instead of full images, reducing bandwidth and improving scalability.
-
----
-
-# Architecture
-
-The system consists of four main components.
-
-## Stage 1 – Edge Device (Head)
-
-Devices located at the edge such as **traffic cameras or embedded devices (Jetson Nano)**.
-
-Responsibilities:
-
-* Capture video frames
-* Run the first layers of YOLOv11
-* Compress intermediate feature maps using quantization
-* Send feature maps to the network
-
----
-
-## Stage 2 – Tail Device (Tail)
-
-Devices located in the **cloud or high-performance servers**.
-
-Responsibilities:
-
-* Receive feature maps from edge devices
-* Run the remaining layers of the neural network
-* Produce final detection results
-
----
-
-## Server – Controller
-
-Central coordination service responsible for:
-
-* Registering clients
-* Selecting model cut-layers
-* Managing inference workflow
-* Coordinating communication using **RabbitMQ**
-
-
----
-<!-- 
-# Data Flow
-
-<p align="center">
-  <img src="imgs/START.png" width="700">
-</p>
-
-The system workflow:
-
-1. Edge device captures video frames.
-2. The head model processes early layers.
-3. Intermediate **feature maps** are transmitted through the network.
-4. Tail device completes the inference. -->
-
----
-
-# Pipeline
-
-<p align="center">
-  <img src="imgs/SI-Inference.jpg" width="900">
-</p>
-
-Pipeline steps:
-
-1. Clients register with the server.
-2. Server collects device information.
-2. The model is split and inference begins.
-
----
-
-# Project Structure
-
-```
-split_inference/
-│
-├── client.py          # Edge or tail inference node
-├── server.py          # Central controller
-├── config.yaml        # System configuration
-├── requirements.txt   # Python dependencies
-│
-├── imgs/              # Images used in README
-|   ├── overview.png
-│   └── SI-Inference.jpg
-│
-├── src/               # Core framework modules
-└── output.csv         # Performance results
+```text
++------------------+        RabbitMQ         +------------------+
+| Edge client      |  intermediate tensors   | Cloud client     |
+| layer_id = 1     +------------------------>+ layer_id = 2     |
+|                  |                         |                  |
+| read video       |                         | receive tensors  |
+| preprocess       |                         | decode tensors   |
+| run head layers  |                         | run tail layers  |
+| compress/send    |                         | postprocess      |
++--------+---------+                         +---------+--------+
+         |                                             |
+         | registration / start / stop                 |
+         v                                             v
+                  +--------------------------+
+                  | Controller server        |
+                  | server.py                |
+                  | register clients         |
+                  | choose split point       |
+                  | send run configuration   |
+                  +--------------------------+
 ```
 
----
+### Components
 
-# How to Run
+| File | Responsibility |
+| --- | --- |
+| `server.py` | Starts the controller service and cleans old RabbitMQ queues. |
+| `client.py` | Starts an edge or cloud inference client. |
+| `src/Server.py` | Registers clients, selects split points, and sends run commands. |
+| `src/Scheduler.py` | Runs edge/cloud inference loops and records metrics. |
+| `src/Transport.py` | Handles RabbitMQ queue limits, async publishing, and back-pressure. |
+| `src/Compress.py` | Quantizes and delta-encodes intermediate feature maps. |
+| `src/Model.py` | Runs partial YOLO layers and postprocesses detections. |
+| `src/Profiler.py` | Profiles per-layer model latency and measures RabbitMQ bandwidth. |
+| `src/Clustering.py` | Selects split points and edge/cloud assignment with Hungarian matching. |
 
-## 1. Clone the repository
+## Runtime Modes
 
-```bash
-git clone https://github.com/filrg/split_inference
-cd split_inference
+The project can run in three modes:
+
+| Mode | Description |
+| --- | --- |
+| `split` | Edge runs head layers, cloud runs tail layers. This is the default when `experiment.enable: False`. |
+| `only_edge` | Edge runs the full model. Cloud only receives lightweight result messages. |
+| `only_cloud` | Edge sends raw frames, cloud runs the full model. Useful as a baseline. |
+
+To enable a baseline mode, set:
+
+```yaml
+experiment:
+  enable: True
+  mode: only_cloud   # split, only_edge, or only_cloud
 ```
 
----
+If `experiment.enable` is `False`, the code uses `split` mode even if
+`experiment.mode` is present in `config.yaml`.
 
-## 2. Install dependencies
+## Data Flow
 
-Python **3.8 or higher** is required.
+1. Start RabbitMQ.
+2. Start `server.py`.
+3. Start one or more clients with `client.py --layer_id 1` for edge nodes.
+4. Start one or more clients with `client.py --layer_id 2` for cloud nodes.
+5. Clients register with the controller through `rpc_queue`.
+6. The controller waits until the expected number of edge and cloud clients is connected.
+7. The controller sends model/configuration data to each client.
+8. Edge clients process video batches and publish intermediate payloads.
+9. Cloud clients consume payloads, finish inference, postprocess detections, and write metrics.
+10. When edge clients finish, the controller sends stop messages and metrics are pivoted.
+
+## Installation
+
+Python 3.8 or newer is recommended.
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
+The project expects a YOLO checkpoint named by `server.model`, for example:
 
-## 3. Start RabbitMQ
-
-RabbitMQ is used for communication between distributed components.
-
-RabbitMQ admin interface:
-
-```
-http://localhost:15672
+```text
+yolo26n.pt
 ```
 
-Default credentials:
+If the checkpoint is missing, the server attempts to load/download it through
+Ultralytics.
 
+## RabbitMQ
+
+RabbitMQ must be reachable by all machines.
+
+Default local settings:
+
+```text
+AMQP:       localhost:5672
+Dashboard: http://localhost:15672
+Username:  guest
+Password:  guest
 ```
-username: guest
-password: guest
+
+For Docker:
+
+```bash
+docker run --rm -it \
+  --name split-rabbitmq \
+  -p 5672:5672 \
+  -p 15672:15672 \
+  rabbitmq:3-management
 ```
 
----
+On multiple machines, set `rabbit.address` in `config.yaml` to the IP address
+of the RabbitMQ host.
 
-# Configuration
+## Configuration
 
-Edit **config.yaml** before running the system.
-
-Example configuration:
+Main configuration lives in `config.yaml`.
 
 ```yaml
 name: YOLO
+
 server:
-  cut-layer: a # or b, c, d
-  clients:
-    - 1
-    - 1
   model: yolo26n
-  batch-size: 5
+  batch-size: 32
+  cut-layer: a
+  clients:
+    - 1   # number of edge clients
+    - 1   # number of cloud clients
+
+experiment:
+  enable: False
+  mode: only_cloud
+
 rabbit:
-  address: 127.0.0.1
+  address: localhost
   username: guest
   password: guest
   virtual-host: /
 
-debug-mode: False
-data: videos/video.mp4
+data: video.mp4
 log-path: .
-control-count: 1
+debug-mode: False
+
 compress:
   enable: True
   num_bit: 8
 ```
 
-Feature map compression:
+### Split Selection
+
+Use a fixed split by disabling clustering:
 
 ```yaml
-compress:
-  enable: True
-  num_bit: 8
+clustering:
+  enable: False
 ```
 
----
+Then choose one of the predefined split labels:
 
-# Running the System
+```yaml
+server:
+  cut-layer: a   # a, b, c, or d
+```
 
-## Step 1 – Start Server
+Use automatic split selection with profiling and Hungarian matching:
+
+```yaml
+clustering:
+  enable: True
+  max_clusters: 3
+  measure_bandwidth: True
+  profile_source: real   # real, auto, or simulated
+```
+
+When `profile_source: real`, every edge and cloud client must be able to load
+the model checkpoint and profile its local layer times.
+
+### Transport and Back-Pressure
+
+Intermediate tensors can be large. The transport settings prevent the edge from
+publishing faster than the cloud can consume.
+
+```yaml
+transport:
+  async_publish: True
+  local_queue_size: 2
+  rabbit_max_queue_messages: 8
+  rabbit_max_queue_bytes: 0
+  rabbit_overflow: reject-publish
+  backpressure_high_watermark: 6
+  backpressure_low_watermark: 3
+  backpressure_poll_sec: 0.02
+  publish_confirm: True
+  consumer_prefetch: 1
+  consumer_poll_sec: 0.02
+```
+
+Recommended starting values:
+
+| Setting | Effect |
+| --- | --- |
+| `async_publish` | Uses a publisher thread so edge inference is not blocked by RabbitMQ serialization and network I/O. |
+| `local_queue_size` | Bounded in-process queue on the edge. Keep this small on Jetson devices. |
+| `rabbit_max_queue_messages` | Hard limit for RabbitMQ intermediate queue depth. |
+| `backpressure_high_watermark` | Edge begins waiting when queue depth reaches this value. |
+| `backpressure_low_watermark` | Edge resumes after the cloud drains the queue to this value. |
+| `publish_confirm` | Waits for broker confirmation. Safer, but slightly slower. |
+| `consumer_prefetch` | Limits unacknowledged messages per cloud consumer. Use `1` for stable latency. |
+
+If end-to-end latency grows every batch, the cloud is slower than the edge.
+Lower `batch-size`, choose an earlier/later split point, add cloud clients, or
+reduce `backpressure_high_watermark`.
+
+## Running
+
+Start the controller first:
 
 ```bash
 python server.py
 ```
 
----
-
-## Step 2 – Start Clients
-
-Edge device:
+Start an edge client:
 
 ```bash
 python client.py --layer_id 1
 ```
 
-Optional CPU mode:
-
-```bash
-python client.py --layer_id 1 --device cpu
-```
-
-Tail device:
+Start a cloud client:
 
 ```bash
 python client.py --layer_id 2
 ```
 
----
+Force CPU execution:
 
-# Tested Hardware
-
-| Device           | Role                   |
-| ---------------- | ---------------------- |
-| Jetson Nano      | Edge Client (Head)     |
-| Jetson Nano      | Tail Client            |
-| Laptop / Desktop | Tracker                |
-| LAN Network      | RabbitMQ communication |
-
----
-
-# Application Scenarios
-
-* Smart traffic monitoring
-* Edge surveillance AI
-* Distributed deep learning research
-* Bandwidth reduction experiments
-
----
-
-# Metrics
-
-After each run, the system produces `metrics_pivoted.csv` with one row per batch. Below is a description of each column.
-
----
-
-## Column Descriptions
-
-| Column | Description |
-|---|---|
-| `batch_id` | Row index in the CSV. When multiple devices run simultaneously, rows from all devices are interleaved into one file. |
-| `batch_size` | Number of frames processed together in one model forward pass. |
-| `best_cut` | Layer index chosen by the Hungarian algorithm to split the model. Edge runs layers from the start up to `best_cut`, cloud runs the remaining layers. |
-
----
-
-## Latency
-
-Measured independently at each device using:
-```
-batch_start = time.perf_counter()   # immediately before processing
-# run assigned model layers, compress / decompress, send / receive
-batch_end   = time.perf_counter()
-
-latency_ms = (batch_end - batch_start) × 1000
+```bash
+python client.py --layer_id 1 --device cpu
+python client.py --layer_id 2 --device cpu
 ```
 
-- **edge_latency_ms** — total time for the edge device to process one batch: includes running its assigned model layers, compressing the feature map, and publishing the message to the queue.
-- **cloud_latency_ms** — total time for the cloud device to process one batch: includes receiving the message, decompressing the feature map, running its assigned model layers, and postprocessing the results.
+Give a client a stable name for profiling and clustering output:
 
----
-
-## FPS
-
-Measured independently at each device using:
-```
-fps = batch_size / (batch_end - prev_batch_end)
+```bash
+python client.py --layer_id 1 --name jetson-edge-1
+python client.py --layer_id 2 --name cloud-gpu-1
 ```
 
-`prev_batch_end` is the finish time of the previous batch on the same device, so FPS reflects how many frames that device completes per second between two consecutive batches. The first batch of every device always reports **0.0** because there is no previous batch to compare against.
+For multi-device experiments, make `server.clients` match the number of clients
+you will start:
 
-The **total system FPS** is the sum of the per-device average FPS across all final devices (cloud devices in split/only-cloud mode, edge devices in only-edge mode), since all final devices process frames in parallel. The first-batch **0.0** values are excluded from the per-device average so they do not distort the result.
-
----
-
-## RAM
-
-```
-ram_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 × 1024)
+```yaml
+server:
+  clients:
+    - 3   # edge clients
+    - 2   # cloud clients
 ```
 
-Reports the **Resident Set Size (RSS)** — physical RAM occupied by that process at the end of each batch. Does not include memory used by other processes on the same machine.
+Then start three `layer_id 1` clients and two `layer_id 2` clients.
 
----
+## Output Files
 
-## Message Size
+The system writes per-run metrics and detection output in the project folder.
 
-Both values are measured on every batch.
+| File | Description |
+| --- | --- |
+| `metrics_raw_<queue>_<client>.csv` | Temporary per-client metrics. |
+| `metrics_pivoted_<queue>.csv` | Joined edge/cloud metrics, one row per processed batch. |
+| `detections_stream.jsonl` | Streaming detection results by frame. |
+| `detections.json` | Final detection results by frame. |
+| `timing_edge_<client>.log` | Edge timing trace. |
+| `timing_cloud_<client>.log` | Cloud timing trace. |
+| `app.log` | Application log. |
 
-- **edge_message_size_bytes** — size in bytes of the pickle-serialized message measured by the edge immediately before publishing to RabbitMQ. When compression is enabled, the message contains the first frame in full (quantized) plus delta-encoded subsequent frames, so this value varies per batch depending on motion between frames within the batch. When compression is disabled, all frames are sent as raw tensors and the size is fixed.
+## Metrics
 
-- **cloud_message_size_bytes** — size in bytes of the raw message received by the cloud from RabbitMQ. This is the same bytes as `edge_message_size_bytes` arriving on the receiving end, so the two columns reflect the same message and should be equal each batch.
+Important columns in `metrics_pivoted_<queue>.csv`:
 
----
+| Column | Meaning |
+| --- | --- |
+| `batch_id` | Batch index in arrival/order after pivoting. |
+| `batch_size` | Number of frames in one model forward pass. |
+| `best_cut` | Split layer chosen by fixed config or Hungarian matching. |
+| `edge_latency_ms` | Edge processing time, including head inference, compression, and publish completion. |
+| `cloud_latency_ms` | Cloud processing time, including receive, decode, tail inference, and postprocess. |
+| `e2e_latency_ms` | End-to-end latency from edge batch start to cloud batch finish. |
+| `edge_message_size_bytes` | Serialized payload size published by the edge. |
+| `cloud_message_size_bytes` | Raw payload size received by the cloud. |
+| `edge_fps`, `cloud_fps` | Per-device batch throughput. |
+| `edge_ram_mb`, `cloud_ram_mb` | Resident memory usage for each process. |
 
-## End-to-End Latency
+End-to-end latency is the best signal for queue pressure:
 
-The edge embeds its processing start time inside every message it sends:
+```text
+e2e_latency = edge_processing + queue_wait + cloud_processing
 ```
-edge side : y = {"edge_start_time": batch_start, ...}
 
-cloud side: e2e_latency_ms = (cloud_batch_end - edge_start_time) × 1000
+If `e2e_latency_ms` increases over time while `cloud_latency_ms` is stable,
+messages are waiting in RabbitMQ and the selected split or batch size is not
+balanced for the available devices.
+
+## Project Layout
+
+```text
+split_inference_test/
+|-- client.py
+|-- server.py
+|-- config.yaml
+|-- requirements.txt
+|-- cfg/
+|-- imgs/
+|-- src/
+|   |-- Clustering.py
+|   |-- Compress.py
+|   |-- Log.py
+|   |-- Model.py
+|   |-- Profiler.py
+|   |-- RpcClient.py
+|   |-- Scheduler.py
+|   |-- Server.py
+|   |-- Transport.py
+|   `-- Utils.py
+`-- tools/
 ```
 
-This captures the full pipeline latency for one batch:
-```
-e2e = edge_latency + queue_wait_time + cloud_latency
-```
+## Troubleshooting
 
-**Queue wait time** is the time a batch spends waiting inside the RabbitMQ intermediate queue before the cloud picks it up. If edge devices send faster than cloud devices can process, batches accumulate in the queue and each subsequent batch waits longer, causing e2e to grow over time. A growing e2e is a sign that the system is unbalanced at the chosen cut point.
+### RabbitMQ queue grows continuously
 
-> **Note:** `batch_start` is recorded after all frames in the batch have been read from the video, so video I/O time is **not** included. E2E measures inference pipeline latency only.
+The cloud cannot keep up. Try:
 
----
+- Reduce `server.batch-size`.
+- Lower `transport.backpressure_high_watermark`.
+- Add more cloud clients.
+- Use a split point that reduces cloud compute or network payload.
+- Enable compression with `compress.enable: True`.
 
-# License
+### Clients wait forever after registration
 
-See [LICENSE](./LICENSE)
+Check that `server.clients` matches the number of clients you started. The
+controller starts inference only after all expected edge and cloud clients have
+registered.
+
+### Model profiling fails
+
+If `clustering.profile_source: real`, each client must have the checkpoint file
+and enough memory to profile the model. Use `profile_source: auto` or
+`profile_source: simulated` for quick experiments.
+
+### RabbitMQ declaration mismatch
+
+If queue arguments were changed between runs, delete old queues or restart
+RabbitMQ. The server also tries to clean old `reply_*`, `rpc_queue`, and
+`intermediate_queue*` queues on startup.
+
+## License
+
+See [LICENSE](./LICENSE).

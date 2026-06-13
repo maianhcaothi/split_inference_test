@@ -8,6 +8,7 @@ import pickle
 import src.Model
 import src.Log
 from ultralytics import YOLO
+from src.Transport import declare_intermediate_queue
 
 from src.Clustering import (
     ManualExperimentConfig,
@@ -65,7 +66,7 @@ class Server:
         # Discard any messages left over from a previous (crashed) run, so
         # depth-based back-pressure starts from an empty queue instead of
         # being thrown off by stale large messages still sitting in RabbitMQ.
-        self.channel.queue_declare(queue='intermediate_queue', durable=False)
+        declare_intermediate_queue(self.channel, 'intermediate_queue', self.config.get("transport", {}))
         self.channel.queue_purge(queue='intermediate_queue')
 
         self.register_clients = [0 for _ in range(len(self.total_clients))]
@@ -144,7 +145,7 @@ class Server:
 
         elif action == "BW_TEST":
             client_id = message["client_id"]
-            self.send_to_response(str(client_id), pickle.dumps({"action": "BW_ACK"}))
+            self.send_to_response(str(client_id), pickle.dumps({"action": "BW_ACK"}, protocol=pickle.HIGHEST_PROTOCOL))
 
         elif action == "NOTIFY":
             self.count_clients += 1
@@ -303,7 +304,7 @@ class Server:
                         # per-cluster queue, same reasoning as 'intermediate_queue' above.
                         for k in range(K):
                             qname = f"intermediate_queue_{k}"
-                            self.channel.queue_declare(queue=qname, durable=False)
+                            declare_intermediate_queue(self.channel, qname, self.config.get("transport", {}))
                             self.channel.queue_purge(queue=qname)
 
                     except Exception as e:
@@ -352,8 +353,8 @@ class Server:
                     "compress":   self.compress,
                     "mode":       self._get_mode(),
                 }
-                self.send_to_response(client_id, pickle.dumps(response))
+                self.send_to_response(client_id, pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL))
         else:
             response = {"action": "STOP", "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:
-                self.send_to_response(client_id, pickle.dumps(response))
+                self.send_to_response(client_id, pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL))

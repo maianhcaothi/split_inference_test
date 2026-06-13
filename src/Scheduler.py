@@ -13,8 +13,8 @@ from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
 
-RAW_FRAME_MB = 3 * 640 * 640 * 4 / (1024 * 1024)  # uncompressed float32 640x640x3 frame, ~4.69MB
-RESULT_MSG_MB = 0.1  # only_edge: estimated size of a batch of detection results (boxes/scores/classes)
+# Fixed cap on intermediate_queue depth (messages) before an edge waits.
+MAX_QUEUE = 20
 
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
@@ -32,10 +32,6 @@ class Scheduler:
                     os.remove(tlog)
                 except Exception:
                     pass
-
-        self._control_queue = f"control_{cid_short}"
-        self._max_queue = 10  # overwritten by MAX_QUEUE updates from the server
-        self.channel.queue_declare(self._control_queue, durable=False)
 
         self.size_message = None
         self.intermediate_queue = f"intermediate_queue"
@@ -63,41 +59,18 @@ class Scheduler:
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
 
-    def _send_ram_report(self, msg_mb):
-        self.send_to_server({
-            "action": "RAM_REPORT",
-            "client_id": self.client_id,
-            "queue_name": self.intermediate_queue,
-            "msg_mb": msg_mb,
-        })
-
-    def _drain_control_queue(self):
-        while True:
-            method, _, body = self.channel.basic_get(self._control_queue, auto_ack=True)
-            if method is None:
-                break
-            try:
-                msg = pickle.loads(body)
-                if msg.get("action") == "MAX_QUEUE":
-                    self._max_queue = msg["value"]
-            except Exception:
-                pass
-
-    def _check_control_queue(self):
-        self._drain_control_queue()
-
+    def _check_backpressure(self):
         depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
-        if depth < self._max_queue:
+        if depth < MAX_QUEUE:
             return
 
         Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={self._max_queue}, waiting", "yellow")
-        while depth >= self._max_queue:
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={MAX_QUEUE}, waiting", "yellow")
+        while depth >= MAX_QUEUE:
             time.sleep(0.1)
-            self._drain_control_queue()
             depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         Log.print_with_color(
-            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={self._max_queue}, resuming", "green")
+            f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={MAX_QUEUE}, resuming", "green")
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -324,7 +297,7 @@ class Scheduler:
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_control_queue()
+                    self._check_backpressure()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
@@ -353,7 +326,7 @@ class Scheduler:
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_control_queue()
+                    self._check_backpressure()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
@@ -390,7 +363,7 @@ class Scheduler:
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_control_queue()
+                    self._check_backpressure()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
@@ -496,16 +469,6 @@ class Scheduler:
             model.eval()
             model.to(self.device)
 
-        # Báo RAM ngay từ đầu (trước khi nhận batch nào) để server có ngưỡng
-        # dựa trên RAM thực tế thay vì dùng default HIGH=10/LOW=3.
-        # only_edge: message chỉ chứa results (boxes/scores/classes), rất nhẹ.
-        # only_cloud/split: message chứa frame thô/feature map, dùng RAW_FRAME_MB
-        # làm ước lượng worst-case (conservative cho split vì feature map thường nhỏ hơn).
-        if mode == "only_edge":
-            self._send_ram_report(RESULT_MSG_MB)
-        else:
-            self._send_ram_report(RAW_FRAME_MB * batch_size)
-
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
@@ -588,8 +551,6 @@ class Scheduler:
                 _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
-
-                self._send_ram_report(received_message_size / (1024 * 1024))
 
                 _write_start = time.perf_counter()
                 self.write_metrics(

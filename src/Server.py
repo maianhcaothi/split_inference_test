@@ -5,7 +5,6 @@ import glob
 import base64
 import pika
 import pickle
-import psutil
 import src.Model
 import src.Log
 from ultralytics import YOLO
@@ -18,10 +17,6 @@ from src.Clustering import (
     get_cut_data_sizes,
     get_raw_input_mb,
 )
-
-RAM_SAFETY_FACTOR = 0.5  # only use up to 50% of available RAM (on this server's machine) for queue buffering
-RAM_RESERVE_MB = 1024  # absolute floor always left for OS/RabbitMQ overhead, before applying RAM_SAFETY_FACTOR
-
 
 class Server:
     def __init__(self, config):
@@ -76,7 +71,6 @@ class Server:
         self.client_profile_data = {}   # {client_id_str: np.array of per-layer times}
         self.client_bandwidth_data = {} # {client_id_str: float MB/s}
         self.client_name_data = {}      # {client_id_str: str name}
-        self._queue_state = {}  # queue_name -> {"edge_control_queues":[...], "high":10, "cloud_msg_mb":{}}
         self._stopping = False
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
@@ -145,26 +139,6 @@ class Server:
         elif action == "BW_TEST":
             client_id = message["client_id"]
             self.send_to_response(str(client_id), pickle.dumps({"action": "BW_ACK"}))
-
-        elif action == "RAM_REPORT":
-            client_id = message["client_id"]
-            queue_name = message["queue_name"]
-            msg_mb = message["msg_mb"]
-            state = self._queue_state.get(queue_name)
-            if state is not None:
-                state["cloud_msg_mb"][str(client_id)] = msg_mb
-                available_mb = psutil.virtual_memory().available / (1024 * 1024)
-                usable_mb = max(0.0, available_mb - RAM_RESERVE_MB)
-                worst_msg_mb = max(state["cloud_msg_mb"].values())
-                total_edges = sum(max(s["n_edges"], 1) for s in self._queue_state.values())
-                per_queue_mb = usable_mb * (max(state["n_edges"], 1) / total_edges)
-                state["high"] = max(1, int((per_queue_mb * RAM_SAFETY_FACTOR) / max(worst_msg_mb, 1e-6)))
-                for ctrl_q in state["edge_control_queues"]:
-                    self.channel.queue_declare(ctrl_q, durable=False)
-                    self.channel.basic_publish('', ctrl_q, pickle.dumps({"action": "MAX_QUEUE", "value": state["high"]}))
-                src.Log.print_with_color(
-                    f"[BackPressure] '{queue_name}' max_queue={state['high']} "
-                    f"(available_mb={available_mb:.1f}, usable_mb={usable_mb:.1f}, per_queue_mb={per_queue_mb:.1f}, msg_mb={worst_msg_mb:.2f})", "cyan")
 
         elif action == "NOTIFY":
             self.count_clients += 1
@@ -267,29 +241,6 @@ class Server:
 
         return solver, result
 
-    def _start_queue_monitor(self, clients_to_notify):
-        queue_names = set(
-            self.client_assignments.get(cid, {}).get("queue_name", "intermediate_queue")
-            for cid, lid in clients_to_notify if lid == 1
-        ) or {"intermediate_queue"}
-
-        self._queue_state = {}
-        for qname in queue_names:
-            edges = [
-                f"control_{str(cid).replace('-', '')[:12]}"
-                for cid, lid in clients_to_notify if lid == 1
-                and self.client_assignments.get(cid, {}).get("queue_name", "intermediate_queue") == qname
-            ]
-            self._queue_state[qname] = {
-                "edge_control_queues": edges,
-                "n_edges": len(edges),
-                "high": 10,
-                "cloud_msg_mb": {},
-            }
-            src.Log.print_with_color(
-                f"[BackPressure] Monitor queue '{qname}': {len(edges)} edge(s), "
-                f"max_queue will be set after first RAM_REPORT", "cyan")
-
     def notify_clients(self, start=True):
         if start:
             default_splits = {"a": 4, "b": 11, "c": 17, "d": 23}
@@ -389,7 +340,6 @@ class Server:
                     "mode":       self._get_mode(),
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
-            self._start_queue_monitor(clients_to_notify)
         else:
             response = {"action": "STOP", "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:

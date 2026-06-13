@@ -62,6 +62,12 @@ class Server:
         self.channel.queue_declare(queue='rpc_queue', durable=False)
         self.channel.queue_purge(queue='rpc_queue')
 
+        # Discard any messages left over from a previous (crashed) run, so
+        # depth-based back-pressure starts from an empty queue instead of
+        # being thrown off by stale large messages still sitting in RabbitMQ.
+        self.channel.queue_declare(queue='intermediate_queue', durable=False)
+        self.channel.queue_purge(queue='intermediate_queue')
+
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.registered_ids = set()
@@ -292,6 +298,13 @@ class Server:
                         splits = int(best_cuts[0]) + 1 if len(best_cuts) > 0 else None
                         src.Log.print_with_color(
                             f"[Clustering] K={K}  best_cuts={best_cuts.tolist()}", "green")
+
+                        # Discard leftovers from a previous (crashed) run for each
+                        # per-cluster queue, same reasoning as 'intermediate_queue' above.
+                        for k in range(K):
+                            qname = f"intermediate_queue_{k}"
+                            self.channel.queue_declare(queue=qname, durable=False)
+                            self.channel.queue_purge(queue=qname)
 
                     except Exception as e:
                         raise RuntimeError(f"Hungarian clustering failed: {e}")

@@ -18,7 +18,7 @@ from src.Model import inference, postprocess_yolo
 # RabbitMQ broker memory on the Hub if too many pile up. split/Hungarian
 # sends small compressed feature maps and has never overflowed, so it's
 # left unconstrained.
-MAX_QUEUE_ONLY_CLOUD = 2
+MAX_QUEUE_ONLY_CLOUD = 10
 
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):

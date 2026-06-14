@@ -649,7 +649,7 @@ class Scheduler:
             except FileNotFoundError:
                 pass
 
-    def _pivot_and_save(self):
+    def _pivot_and_save(self, splits=None):
         import glob as _glob
 
         # Namespaced theo intermediate_queue: mỗi cluster Hungarian (intermediate_queue_k)
@@ -657,6 +657,7 @@ class Scheduler:
         lock_path = f"metrics_pivot_{self.intermediate_queue}.lock"
         out_path = f"metrics_pivoted_{self.intermediate_queue}_{self.device_name}.csv"
         raw_glob = f"metrics_raw_{self.intermediate_queue}_*.csv"
+        expected_best_cut = "N/A" if splits is None else str(splits)
 
         # Chỉ 1 client thắng lock mới làm pivot (atomic exclusive create)
         try:
@@ -668,7 +669,7 @@ class Scheduler:
         # Luôn dọn lock + raw files dù pivot lỗi giữa chừng (vd. OOM-kill khi
         # đang pivot) — nếu không, run sau sẽ bị gộp lẫn dữ liệu với run này.
         try:
-            self._do_pivot(out_path, raw_glob)
+            self._do_pivot(out_path, raw_glob, expected_best_cut)
         finally:
             for fpath in _glob.glob(raw_glob):
                 try:
@@ -680,7 +681,7 @@ class Scheduler:
             except FileNotFoundError:
                 pass
 
-    def _do_pivot(self, out_path, raw_glob):
+    def _do_pivot(self, out_path, raw_glob, expected_best_cut):
         import glob as _glob
 
         # Đợi các client còn lại ghi xong hàng cuối
@@ -713,6 +714,9 @@ class Scheduler:
             with open(fpath, newline="") as f:
                 rows_in_file = list(csv.DictReader(f))
             if not rows_in_file:
+                continue
+            if rows_in_file[0].get("best_cut") != expected_best_cut:
+                # File rác từ lần chạy khác (mode/cut khác) còn sót lại — bỏ qua
                 continue
             role = rows_in_file[0]["role"]
             if role in ("edge", "edge_sender"):
@@ -843,7 +847,7 @@ class Scheduler:
                 Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
                 traceback.print_exc()
             if mode == "only_edge":
-                self._pivot_and_save()
+                self._pivot_and_save(splits)
         elif self.layer_id == num_layers:
             self._setup_metrics_fanout_queue()
             try:
@@ -857,6 +861,6 @@ class Scheduler:
                     self._last_unacked_delivery_tag = None
                 Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
                 traceback.print_exc()
-            self._pivot_and_save()
+            self._pivot_and_save(splits)
         else:
             self.middle_layer(model)

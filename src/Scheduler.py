@@ -29,7 +29,7 @@ from src.Transport import (
 MAX_QUEUE_ONLY_CLOUD = 15
 
 class Scheduler:
-    def __init__(self, client_id, layer_id, channel, device, rabbit_config=None, transport=None):
+    def __init__(self, client_id, layer_id, channel, device, rabbit_config=None, transport=None, name=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
@@ -40,9 +40,11 @@ class Scheduler:
         if self.transport["async_publish"] and self.rabbit_config is not None and self.layer_id == 1:
             self.publisher = RabbitAsyncPublisher(self.rabbit_config, self.transport)
 
-        cid_short = str(client_id).replace('-', '')[:12]
-        self._timing_log_edge  = f"timing_edge_{cid_short}.log"
-        self._timing_log_cloud = f"timing_cloud_{cid_short}.log"
+        # Tên ngắn dùng để đặt tên file metric/timing — dùng --name nếu có,
+        # nếu không thì fallback về client_id (đảm bảo vẫn duy nhất).
+        self.device_name = name or str(client_id).replace('-', '')[:12]
+        self._timing_log_edge  = f"timing_edge_{self.device_name}.log"
+        self._timing_log_cloud = f"timing_cloud_{self.device_name}.log"
         for tlog in [self._timing_log_edge, self._timing_log_cloud]:
             if os.path.exists(tlog):
                 try:
@@ -53,6 +55,7 @@ class Scheduler:
         self.size_message = None
         self.intermediate_queue = f"intermediate_queue"
         declare_intermediate_queue(self.channel, self.intermediate_queue, self.transport)
+        self._cleanup_stale_metrics_files(self.intermediate_queue)
         try:
             self.channel.basic_qos(prefetch_count=max(1, self.transport["consumer_prefetch"]))
         except Exception:
@@ -102,7 +105,7 @@ class Scheduler:
         return (time.perf_counter() - wait_start) * 1000
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
-        file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
+        file_path = f"metrics_raw_{self.intermediate_queue}_{self.device_name}.csv"
         file_exists = os.path.exists(file_path)
 
         with open(file_path, "a", newline="") as f:
@@ -242,7 +245,7 @@ class Scheduler:
                 for i in range(len(r["boxes"]))
             ]
             self._det_results[frame_num] = dets
-            with open("detections_stream.jsonl", "a") as f:
+            with open(f"detections_stream_{self.intermediate_queue}.jsonl", "a") as f:
                 f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
             if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
@@ -270,7 +273,7 @@ class Scheduler:
 
     def _write_detections_json(self):
         import json
-        out = "detections.json"
+        out = f"detections_{self.intermediate_queue}.json"
         with open(out, "w") as f:
             json.dump({str(k): v for k, v in sorted(self._det_results.items())}, f)
         Log.print_with_color(f"[Tracker] Saved {out} ({len(self._det_results)} frames)", "green")
@@ -315,20 +318,16 @@ class Scheduler:
             input_image.append(tensor)
 
             if len(input_image) == batch_size:
-                t_batch_ready = time.perf_counter()
-                gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 edge_start_wall = time.time()
 
-                _stack_start = time.perf_counter()
                 input_image = torch.stack(input_image)
                 if mode != "only_cloud":
                     # only_cloud: edge does no GPU inference, keep frames on CPU
                     # to avoid a wasted CPU->GPU->CPU round trip before sending.
                     input_image = input_image.to(self.device, non_blocking=True)
-                stack_ms = (time.perf_counter() - _stack_start) * 1000
 
                 inference_ms = 0.0
                 queue_wait_ms = 0.0
@@ -420,9 +419,7 @@ class Scheduler:
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = 0.0
-                _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
-                ram_ms = (time.perf_counter() - _ram_start) * 1000
                 metric_kwargs = {
                     "mode": mode,
                     "role": "edge_sender" if mode == "only_cloud" else "edge",
@@ -438,17 +435,11 @@ class Scheduler:
                     "_batch_start_perf": batch_start,
                 }
                 pending_edge_metrics.append((publish_future, metric_kwargs))
-                _write_start = time.perf_counter()
                 pending_edge_metrics = self._drain_edge_publish_metrics(pending_edge_metrics, block=False)
-                write_ms = (time.perf_counter() - _write_start) * 1000
 
-                batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
-                Log.print_with_color(
-                    f"[Timing][edge] gap={gap_ms:.1f}ms stack={stack_ms:.1f}ms "
-                    f"inference={inference_ms:.1f}ms queue_wait={queue_wait_ms:.1f}ms send={send_ms:.1f}ms "
-                    f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
-                    f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
-                    "magenta"
+                pbar.set_postfix_str(
+                    f"infer={inference_ms:.0f}ms wait={queue_wait_ms:.0f}ms send={send_ms:.0f}ms "
+                    f"lat={latency_ms:.0f}ms fps={fps:.2f} ram={ram_mb:.0f}MB"
                 )
 
                 batch_id += 1
@@ -467,7 +458,7 @@ class Scheduler:
         pbar.close()
 
         # Broadcast metrics CSV lên tất cả cloud trong cluster qua fanout exchange
-        metrics_file = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
+        metrics_file = f"metrics_raw_{self.intermediate_queue}_{self.device_name}.csv"
         if os.path.exists(metrics_file):
             try:
                 with open(metrics_file, 'rb') as f:
@@ -518,8 +509,6 @@ class Scheduler:
             method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=False)
             if method_frame and body:
                 self._last_unacked_delivery_tag = method_frame.delivery_tag
-                t_batch_ready = time.perf_counter()
-                gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
@@ -593,11 +582,8 @@ class Scheduler:
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
-                _ram_start = time.perf_counter()
                 ram_mb = self.get_ram_mb()
-                ram_ms = (time.perf_counter() - _ram_start) * 1000
 
-                _write_start = time.perf_counter()
                 self.write_metrics(
                     mode=mode,
                     role="cloud",
@@ -611,15 +597,10 @@ class Scheduler:
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_time,
                 )
-                write_ms = (time.perf_counter() - _write_start) * 1000
 
-                batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
-                Log.print_with_color(
-                    f"[Timing][cloud] gap={gap_ms:.1f}ms decode={decode_ms:.1f}ms "
-                    f"inference={inference_ms:.1f}ms postprocess={postprocess_ms:.1f}ms "
-                    f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
-                    f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
-                    "magenta"
+                pbar.set_postfix_str(
+                    f"decode={decode_ms:.0f}ms infer={inference_ms:.0f}ms post={postprocess_ms:.0f}ms "
+                    f"lat={latency_ms:.0f}ms fps={fps:.2f} ram={ram_mb:.0f}MB"
                 )
 
                 self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
@@ -652,13 +633,29 @@ class Scheduler:
     def middle_layer(self, model):
         pass
 
+    def _cleanup_stale_metrics_files(self, queue_name):
+        """Dọn file metric/lock còn sót lại từ run trước cho queue này.
+        metrics_raw_*.csv chỉ "append" và không bị xoá nếu pivot chưa từng
+        chạy thành công (vd. run trước OOM/crash giữa lúc pivot khiến
+        metrics_pivot_*.lock kẹt lại). Nếu không dọn ở đây, dữ liệu của
+        nhiều run khác nhau sẽ bị gộp lẫn vào cùng 1 file pivoted."""
+        for fpath in [
+            f"metrics_raw_{queue_name}_{self.device_name}.csv",
+            f"metrics_pivot_{queue_name}.lock",
+            f"detections_stream_{queue_name}.jsonl",
+        ]:
+            try:
+                os.remove(fpath)
+            except FileNotFoundError:
+                pass
+
     def _pivot_and_save(self):
         import glob as _glob
 
         # Namespaced theo intermediate_queue: mỗi cluster Hungarian (intermediate_queue_k)
         # pivot độc lập, không xóa/ghi đè file của cluster khác chạy chung thư mục.
         lock_path = f"metrics_pivot_{self.intermediate_queue}.lock"
-        out_path = f"metrics_pivoted_{self.intermediate_queue}.csv"
+        out_path = f"metrics_pivoted_{self.intermediate_queue}_{self.device_name}.csv"
         raw_glob = f"metrics_raw_{self.intermediate_queue}_*.csv"
 
         # Chỉ 1 client thắng lock mới làm pivot (atomic exclusive create)
@@ -667,6 +664,24 @@ class Scheduler:
             os.close(fd)
         except FileExistsError:
             return  # Client khác đang làm pivot
+
+        # Luôn dọn lock + raw files dù pivot lỗi giữa chừng (vd. OOM-kill khi
+        # đang pivot) — nếu không, run sau sẽ bị gộp lẫn dữ liệu với run này.
+        try:
+            self._do_pivot(out_path, raw_glob)
+        finally:
+            for fpath in _glob.glob(raw_glob):
+                try:
+                    os.remove(fpath)
+                except FileNotFoundError:
+                    pass
+            try:
+                os.remove(lock_path)
+            except FileNotFoundError:
+                pass
+
+    def _do_pivot(self, out_path, raw_glob):
+        import glob as _glob
 
         # Đợi các client còn lại ghi xong hàng cuối
         time.sleep(2.0)
@@ -762,16 +777,6 @@ class Scheduler:
                     "e2e_latency_ms":          c.get("e2e_latency_ms") or e.get("e2e_latency_ms", ""),
                 })
 
-        for fpath in _glob.glob(raw_glob):
-            try:
-                os.remove(fpath)
-            except FileNotFoundError:
-                pass
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
-
         def avg(rows, key, skip_zero_fps=False):
             filtered = rows
             if skip_zero_fps:
@@ -828,6 +833,7 @@ class Scheduler:
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             declare_intermediate_queue(self.channel, self.intermediate_queue, self.transport)
+            self._cleanup_stale_metrics_files(self.intermediate_queue)
 
         if self.layer_id == 1:
             try:

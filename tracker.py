@@ -9,8 +9,9 @@ Usage:
     python tracker.py                            # realtime, video từ config.yaml
     python tracker.py --mode post                # render ra output.mp4 sau khi xong
     python tracker.py --video path/video.mp4
-    python tracker.py --stream detections_stream.jsonl
-    python tracker.py --detections detections.json --mode post
+    python tracker.py --queue intermediate_queue_0           # chọn cluster (mặc định: intermediate_queue)
+    python tracker.py --stream detections_stream_intermediate_queue_0.jsonl
+    python tracker.py --detections detections_intermediate_queue_0.json --mode post
 """
 import os
 import cv2
@@ -56,10 +57,17 @@ parser = argparse.ArgumentParser(description="Tracker: render detections lên vi
 parser.add_argument("--mode", choices=["realtime", "post"], default="realtime",
                     help="realtime=chạy song song inference | post=render file sau khi xong")
 parser.add_argument("--video", default=None)
-parser.add_argument("--stream", default="detections_stream.jsonl", help="Stream file (realtime mode)")
-parser.add_argument("--detections", default="detections.json", help="Detections file (post mode)")
+parser.add_argument("--queue", default="intermediate_queue",
+                    help="Tên intermediate_queue ứng với cluster muốn xem (vd. intermediate_queue_0)")
+parser.add_argument("--stream", default=None, help="Stream file (realtime mode); mặc định detections_stream_<queue>.jsonl")
+parser.add_argument("--detections", default=None, help="Detections file (post mode); mặc định detections_<queue>.json")
 parser.add_argument("--output", default="output.mp4", help="Output video (post mode)")
 args = parser.parse_args()
+
+if args.stream is None:
+    args.stream = f"detections_stream_{args.queue}.jsonl"
+if args.detections is None:
+    args.detections = f"detections_{args.queue}.json"
 
 if args.video is None:
     args.video = get_video_path()

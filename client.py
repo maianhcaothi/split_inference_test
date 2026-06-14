@@ -97,7 +97,7 @@ if __name__ == "__main__":
     data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
             "message": "Hello from Client!", "layer_times": layer_times,
             "bandwidth_mb_s": bandwidth_mb_s, "client_name": args.name}
-    scheduler = Scheduler(client_id, args.layer_id, channel, device, config["rabbit"], config.get("transport", {}))
+    scheduler = Scheduler(client_id, args.layer_id, channel, device, config["rabbit"], config.get("transport", {}), name=args.name)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")
     client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device)

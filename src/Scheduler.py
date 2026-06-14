@@ -159,7 +159,9 @@ class Scheduler:
             return self.publisher.submit(intermediate_queue, data, compress)
 
         message, size_bytes, prepare_ms = prepare_intermediate_message(data, compress)
+        wait_start_ns = time.time_ns()
         remote_wait_ms = self._check_backpressure()
+        wait_end_ns = time.time_ns()
         publish_start = time.perf_counter()
         self.channel.basic_publish(exchange='', routing_key=intermediate_queue, body=message)
         publish_ms = (time.perf_counter() - publish_start) * 1000
@@ -171,6 +173,8 @@ class Scheduler:
                 remote_wait_ms=remote_wait_ms,
                 publish_ms=publish_ms,
                 completed_perf=time.perf_counter(),
+                wait_start_ns=wait_start_ns,
+                wait_end_ns=wait_end_ns,
             )
         )
 
@@ -186,6 +190,10 @@ class Scheduler:
             batch_start_perf = metric_kwargs.pop("_batch_start_perf", None)
             if batch_start_perf is not None and receipt.completed_perf:
                 metric_kwargs["latency_ms"] = (receipt.completed_perf - batch_start_perf) * 1000
+            if receipt.remote_wait_ms > 1.0 and receipt.wait_end_ns > receipt.wait_start_ns:
+                with open(self._timing_log_edge, "a") as _tf:
+                    print(f"{receipt.wait_start_ns} queue_wait_start", file=_tf)
+                    print(f"{receipt.wait_end_ns} queue_wait_end", file=_tf)
             self.write_metrics(**metric_kwargs)
         return remaining
 
@@ -342,13 +350,6 @@ class Scheduler:
                         "height": height,
                         "edge_start_time": edge_start_wall
                     }
-
-                    _wait_start = time.perf_counter()
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
-                    queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
                     publish_future = self.send_next_layer(

@@ -68,6 +68,8 @@ class PublishReceipt:
     publish_ms: float
     local_wait_ms: float = 0.0
     completed_perf: float = 0.0
+    wait_start_ns: int = 0
+    wait_end_ns: int = 0
 
 
 class PublishFuture:
@@ -138,8 +140,16 @@ class RabbitAsyncPublisher:
         self.transport = transport_config(transport)
         self.logger = logger
         self._jobs = queue.Queue(maxsize=max(1, self.transport["local_queue_size"]))
+        # Calibration to convert this thread's perf_counter() readings into
+        # wall-clock time_ns(), so backpressure-wait timestamps line up with
+        # the epoch timestamps written to the timing logs by the main thread.
+        self._epoch_ns0 = time.time_ns()
+        self._perf0 = time.perf_counter()
         self._thread = threading.Thread(target=self._run, name="rabbit-publisher", daemon=True)
         self._thread.start()
+
+    def _to_epoch_ns(self, perf_value):
+        return self._epoch_ns0 + int((perf_value - self._perf0) * 1e9)
 
     def submit(self, queue_name, data, compress):
         future = PublishFuture()
@@ -209,7 +219,9 @@ class RabbitAsyncPublisher:
                 try:
                     declare_intermediate_queue(channel, queue_name, self.transport)
                     body, size_bytes, prepare_ms = prepare_intermediate_message(data, compress)
+                    wait_start_perf = time.perf_counter()
                     remote_wait_ms = self._wait_remote_backpressure(channel, queue_name)
+                    wait_end_perf = time.perf_counter()
                     publish_ms = self._publish_with_retry(channel, queue_name, body)
                     completed_perf = time.perf_counter()
                     future.set_result(
@@ -220,6 +232,8 @@ class RabbitAsyncPublisher:
                             publish_ms=publish_ms,
                             local_wait_ms=future.local_wait_ms,
                             completed_perf=completed_perf,
+                            wait_start_ns=self._to_epoch_ns(wait_start_perf),
+                            wait_end_ns=self._to_epoch_ns(wait_end_perf),
                         )
                     )
                 except Exception as exc:

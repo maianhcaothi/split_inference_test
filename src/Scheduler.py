@@ -104,7 +104,8 @@ class Scheduler:
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} <= low_watermark={low_watermark}, resuming", "green")
         return (time.perf_counter() - wait_start) * 1000
 
-    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
+    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None,
+                      inference_ms=0.0, decode_ms=0.0, postprocess_ms=0.0, send_ms=0.0, queue_wait_ms=0.0):
         file_path = f"metrics_raw_{self.intermediate_queue}_{self.device_name}.csv"
         file_exists = os.path.exists(file_path)
 
@@ -124,6 +125,11 @@ class Scheduler:
                     "message_size_bytes",
                     "e2e_latency_ms",
                     "edge_start_time",
+                    "inference_ms",
+                    "decode_ms",
+                    "postprocess_ms",
+                    "send_ms",
+                    "queue_wait_ms",
                 ])
 
             writer.writerow([
@@ -138,6 +144,11 @@ class Scheduler:
                 message_size_bytes,
                 round(e2e_latency_ms, 3),
                 edge_start_time if edge_start_time is not None else "",
+                round(inference_ms, 3),
+                round(decode_ms, 3),
+                round(postprocess_ms, 3),
+                round(send_ms, 3),
+                round(queue_wait_ms, 3),
             ])
 
     def _setup_metrics_fanout_queue(self):
@@ -190,10 +201,15 @@ class Scheduler:
             batch_start_perf = metric_kwargs.pop("_batch_start_perf", None)
             if batch_start_perf is not None and receipt.completed_perf:
                 metric_kwargs["latency_ms"] = (receipt.completed_perf - batch_start_perf) * 1000
+            metric_kwargs["queue_wait_ms"] = metric_kwargs.get("queue_wait_ms", 0.0) + receipt.remote_wait_ms
             if receipt.remote_wait_ms > 1.0 and receipt.wait_end_ns > receipt.wait_start_ns:
                 with open(self._timing_log_edge, "a") as _tf:
                     print(f"{receipt.wait_start_ns} queue_wait_start", file=_tf)
                     print(f"{receipt.wait_end_ns} queue_wait_end", file=_tf)
+            if future.local_wait_ms > 1.0 and future.local_wait_end_ns > future.local_wait_start_ns:
+                with open(self._timing_log_edge, "a") as _tf:
+                    print(f"{future.local_wait_start_ns} local_queue_wait_start", file=_tf)
+                    print(f"{future.local_wait_end_ns} local_queue_wait_end", file=_tf)
             self.write_metrics(**metric_kwargs)
         return remaining
 
@@ -338,6 +354,7 @@ class Scheduler:
                     input_image = input_image.to(self.device, non_blocking=True)
 
                 inference_ms = 0.0
+                postprocess_ms = 0.0
                 queue_wait_ms = 0.0
                 send_ms = 0.0
 
@@ -351,6 +368,8 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " inference_done", file=_tf)
                     _send_start = time.perf_counter()
                     publish_future = self.send_next_layer(
                         self.intermediate_queue,
@@ -369,10 +388,14 @@ class Scheduler:
                         x, y = inference(model, input_image, y, 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
+                    _post_start = time.perf_counter()
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                     map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
+                    postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " inference_done", file=_tf)
                     _send_start = time.perf_counter()
                     payload = {
                         "width": width,
@@ -408,6 +431,8 @@ class Scheduler:
                         "edge_start_time": edge_start_wall
                     }
 
+                    with open(self._timing_log_edge, "a") as _tf:
+                        print(str(time.time_ns()) + " inference_done", file=_tf)
                     _send_start = time.perf_counter()
                     publish_future = self.send_next_layer(
                         self.intermediate_queue,y,compress
@@ -433,6 +458,11 @@ class Scheduler:
                     "message_size_bytes": 0,
                     "e2e_latency_ms": e2e_latency_ms,
                     "edge_start_time": edge_start_wall,
+                    "inference_ms": inference_ms,
+                    "decode_ms": 0.0,
+                    "postprocess_ms": postprocess_ms,
+                    "send_ms": send_ms,
+                    "queue_wait_ms": queue_wait_ms,
                     "_batch_start_perf": batch_start,
                 }
                 pending_edge_metrics.append((publish_future, metric_kwargs))
@@ -577,9 +607,9 @@ class Scheduler:
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
                 batch_end = time.perf_counter()
+                cloud_end_wall = time.time()
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(time.time_ns()) + " output", file=_tf)
-                cloud_end_wall = time.time()
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
@@ -597,6 +627,9 @@ class Scheduler:
                     message_size_bytes=received_message_size,
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_time,
+                    inference_ms=inference_ms,
+                    decode_ms=decode_ms,
+                    postprocess_ms=postprocess_ms,
                 )
 
                 pbar.set_postfix_str(
@@ -756,7 +789,9 @@ class Scheduler:
         fieldnames = [
             "batch_id", "batch_size", "best_cut",
             "edge_device", "edge_latency_ms", "edge_fps", "edge_ram_mb", "edge_message_size_bytes",
+            "edge_inference_ms", "edge_postprocess_ms", "edge_send_ms", "edge_queue_wait_ms",
             "cloud_device", "cloud_arrival_order", "cloud_latency_ms", "cloud_fps", "cloud_ram_mb", "cloud_message_size_bytes",
+            "cloud_decode_ms", "cloud_inference_ms", "cloud_postprocess_ms",
             "e2e_latency_ms",
         ]
 
@@ -773,12 +808,19 @@ class Scheduler:
                     "edge_fps":                e.get("fps", ""),
                     "edge_ram_mb":             e.get("ram_mb", ""),
                     "edge_message_size_bytes": e.get("message_size_bytes", ""),
+                    "edge_inference_ms":       e.get("inference_ms", ""),
+                    "edge_postprocess_ms":     e.get("postprocess_ms", ""),
+                    "edge_send_ms":            e.get("send_ms", ""),
+                    "edge_queue_wait_ms":      e.get("queue_wait_ms", ""),
                     "cloud_device":            c.get("device_seq", ""),
                     "cloud_arrival_order":     c.get("batch_id", ""),
                     "cloud_latency_ms":        c.get("latency_ms", ""),
                     "cloud_fps":               c.get("fps", ""),
                     "cloud_ram_mb":            c.get("ram_mb", ""),
                     "cloud_message_size_bytes":c.get("message_size_bytes", ""),
+                    "cloud_decode_ms":         c.get("decode_ms", ""),
+                    "cloud_inference_ms":      c.get("inference_ms", ""),
+                    "cloud_postprocess_ms":    c.get("postprocess_ms", ""),
                     "e2e_latency_ms":          c.get("e2e_latency_ms") or e.get("e2e_latency_ms", ""),
                 })
 

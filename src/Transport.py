@@ -78,6 +78,8 @@ class PublishFuture:
         self._receipt = None
         self._error = None
         self.local_wait_ms = 0.0
+        self.local_wait_start_ns = 0
+        self.local_wait_end_ns = 0
 
     def done(self):
         return self._event.is_set()
@@ -155,7 +157,10 @@ class RabbitAsyncPublisher:
         future = PublishFuture()
         start = time.perf_counter()
         self._jobs.put((queue_name, data, compress, future))
-        future.local_wait_ms = (time.perf_counter() - start) * 1000
+        end = time.perf_counter()
+        future.local_wait_ms = (end - start) * 1000
+        future.local_wait_start_ns = self._to_epoch_ns(start)
+        future.local_wait_end_ns = self._to_epoch_ns(end)
         return future
 
     def close(self):

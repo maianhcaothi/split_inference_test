@@ -77,6 +77,7 @@ class Server:
         self.client_assignments = {}    # {client_id: {"splits": int, "queue_name": str}}
         self.client_profile_data = {}   # {client_id_str: np.array of per-layer times}
         self.client_bandwidth_data = {} # {client_id_str: float MB/s}
+        self.client_compress_rate_data = {} # {client_id_str: float ms/MB (encode neu edge, decode neu cloud)}
         self.client_name_data = {}      # {client_id_str: str name}
         self._stopping = False
         self.channel.basic_qos(prefetch_count=1)
@@ -131,6 +132,12 @@ class Server:
                 self.client_bandwidth_data[str(client_id)] = float(bandwidth_mb_s)
                 src.Log.print_with_color(
                     f"[Bandwidth] Stored bandwidth from client {client_id}: {bandwidth_mb_s:.1f} MB/s", "cyan")
+
+            compress_rate_ms_per_mb = message.get("compress_rate_ms_per_mb", None)
+            if compress_rate_ms_per_mb is not None:
+                self.client_compress_rate_data[str(client_id)] = float(compress_rate_ms_per_mb)
+                src.Log.print_with_color(
+                    f"[Compress] Stored compress rate from client {client_id}: {compress_rate_ms_per_mb:.3f} ms/MB", "magenta")
 
             client_name = message.get("client_name", None)
             if client_name:
@@ -210,12 +217,20 @@ class Server:
             ]) if edge_clients else np.full((N, M), network_rate)
             cloud_clients = [cid for cid, lid in self.list_clients
                              if lid == len(self.total_clients) and str(cid) in self.client_profile_data]
+            encode_rates = np.array([
+                self.client_compress_rate_data.get(str(cid), 0.0) for cid in edge_clients
+            ])
+            decode_rates = np.array([
+                self.client_compress_rate_data.get(str(cid), 0.0) for cid in cloud_clients
+            ])
             solver = DeterministicSimilarityAssignmentSolver(
                 client_layer_times=np.vstack(edge_times_list),
                 server_layer_times=np.vstack(cloud_times_list),
                 cut_data_sizes=get_cut_data_sizes(self.model_name, self.batch_size),
                 input_data_size=get_raw_input_mb(self.batch_size),
                 network_rates=rates_matrix,
+                encode_rate_ms_per_mb=encode_rates,
+                decode_rate_ms_per_mb=decode_rates,
             )
             solver.client_type_names = [
                 self.client_name_data.get(str(cid), f"edge_{str(cid)[:8]}")

@@ -18,7 +18,7 @@ print("[1/5] Importing libraries...", flush=True)
 try:
     import numpy as np
     import torch
-    from src.Compress import Encoder
+    from src.Compress import Encoder, encode_quant_delta
 except Exception as e:
     print(f"[ERROR] Import failed: {e}", flush=True)
     sys.exit(1)
@@ -109,7 +109,29 @@ for cut in range(n - 1):
 
         size_mb = len(pickle.dumps(payload)) / (1024 * 1024)
         cut_sizes_mb.append(round(size_mb, 2))
-        print(f"  cut={cut:2d}  size={size_mb:.2f} MB", flush=True)
+
+        if args.compress:
+            # Breakdown: cost of the keyframe slot (k=0 alone) vs average cost
+            # of a delta slot (k=1..B-1), within this SAME batch — matches the
+            # real Encoder/encode_quant_delta behavior (per-batch, no cross-batch state).
+            kf_bytes = 0
+            delta_bytes_total = 0
+            n_delta_frames = 0
+            for t in y_edge:
+                if t is None:
+                    continue
+                arr = t.cpu().numpy().reshape(t.shape[0], -1)
+                B = arr.shape[0]
+                full = encode_quant_delta(arr, args.num_bit)
+                kf_only = encode_quant_delta(arr[:1], args.num_bit)
+                kf_bytes += len(kf_only)
+                delta_bytes_total += len(full) - len(kf_only)
+                n_delta_frames += (B - 1)
+            kf_mb = kf_bytes / (1024 * 1024)
+            avg_delta_mb = (delta_bytes_total / n_delta_frames) / (1024 * 1024) if n_delta_frames else 0.0
+            print(f"  cut={cut:2d}  size={size_mb:.2f} MB  (keyframe_slot={kf_mb:.3f} MB, avg_delta_slot={avg_delta_mb:.3f} MB)", flush=True)
+        else:
+            print(f"  cut={cut:2d}  size={size_mb:.2f} MB", flush=True)
     except Exception as e:
         print(f"  cut={cut:2d}  ERROR: {e}", flush=True)
         cut_sizes_mb.append(0.0)

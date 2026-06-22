@@ -94,9 +94,23 @@ if __name__ == "__main__":
             bandwidth_mb_s = float(clustering_cfg.get("network_rate_mb_s", 100.0))
             src.Log.print_with_color(f"[Bandwidth] Using fixed rate from config: {bandwidth_mb_s} MB/s", "cyan")
 
+    compress_rate_ms_per_mb = None
+    if clustering_cfg.get("enable", False) and clustering_cfg.get("measure_compress_rate", True):
+        try:
+            from src.Profiler import measure_compression_rate
+            total_layers = len(config["server"]["clients"])
+            role = "edge" if args.layer_id == 1 else ("cloud" if args.layer_id == total_layers else None)
+            if role is not None:
+                compress_rate_ms_per_mb = measure_compression_rate(
+                    role, batch_size=config["server"]["batch-size"]
+                )
+        except Exception as e:
+            src.Log.print_with_color(f"[Compress] Warning: {e}", "yellow")
+
     data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
             "message": "Hello from Client!", "layer_times": layer_times,
-            "bandwidth_mb_s": bandwidth_mb_s, "client_name": args.name}
+            "bandwidth_mb_s": bandwidth_mb_s, "client_name": args.name,
+            "compress_rate_ms_per_mb": compress_rate_ms_per_mb}
     scheduler = Scheduler(client_id, args.layer_id, channel, device, config["rabbit"], config.get("transport", {}), name=args.name)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")

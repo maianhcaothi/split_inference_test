@@ -8,6 +8,7 @@ import csv
 import os
 import psutil
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from src.Compress import Decoder
 import src.Log as Log
@@ -68,6 +69,9 @@ class Scheduler:
         self._map_updated = False
         self._last_unacked_delivery_tag = None
         self._load_gt_dict()
+        # mAP (conf=0.001) chi phuc vu danh gia/nghien cuu, KHONG thuoc pipeline
+        # san pham thuc. Chay nen (background) de KHONG cong vao batch_end/fps.
+        self._map_executor = ThreadPoolExecutor(max_workers=1)
 
     def get_ram_mb(self):
         try:
@@ -252,6 +256,31 @@ class Scheduler:
             }
         Log.print_with_color(f"[mAP] Loaded GT for {len(self.gt_dict)} frames from '{gt_dir}'", "green")
 
+    def _submit_map_eval(self, x, batch_results, batch_id, batch_size):
+        """Chay NMS@0.001 + ghi file/cap nhat mAP o luong nen (background thread).
+        Day la cong viec CHI phuc vu danh gia/nghien cuu (khong thuoc pipeline
+        san pham thuc), nen KHONG duoc tinh vao batch_end/fps cua batch chinh.
+        Clone tensor truoc khi giao cho luong nen de tranh xung dot voi batch
+        tiep theo dang ghi de len buffer."""
+        x_cloned = x.detach().clone()
+        results_cloned = [
+            {
+                "boxes": r["boxes"].detach().clone(),
+                "scores": r["scores"].detach().clone(),
+                "classes": r["classes"].detach().clone(),
+            }
+            for r in batch_results
+        ]
+
+        def _job():
+            try:
+                map_results = postprocess_yolo(x_cloned, conf_thres=0.001, iou_thres=0.5)
+                self._update_map(results_cloned, batch_id, batch_size, map_results=map_results)
+            except Exception:
+                Log.print_with_color(f"[mAP] Background eval failed:\n{traceback.format_exc()}", "red")
+
+        self._map_executor.submit(_job)
+
     def _update_map(self, batch_results, batch_id, batch_size, map_results=None):
         import json
         self._map_updated = True
@@ -329,6 +358,7 @@ class Scheduler:
         pending_edge_metrics = []
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -349,8 +379,6 @@ class Scheduler:
 
                 input_image = torch.stack(input_image)
                 if mode != "only_cloud":
-                    # only_cloud: edge does no GPU inference, keep frames on CPU
-                    # to avoid a wasted CPU->GPU->CPU round trip before sending.
                     input_image = input_image.to(self.device, non_blocking=True)
 
                 inference_ms = 0.0
@@ -390,9 +418,8 @@ class Scheduler:
 
                     _post_start = time.perf_counter()
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
-                    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                    self._update_map(results, batch_id, batch_size, map_results=map_results)
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
+                    self._submit_map_eval(x, results, batch_id, batch_size)
 
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " inference_done", file=_tf)
@@ -467,19 +494,18 @@ class Scheduler:
                 }
                 pending_edge_metrics.append((publish_future, metric_kwargs))
                 pending_edge_metrics = self._drain_edge_publish_metrics(pending_edge_metrics, block=False)
-
+                prev_batch_end = batch_end
                 pbar.set_postfix_str(
                     f"infer={inference_ms:.0f}ms wait={queue_wait_ms:.0f}ms send={send_ms:.0f}ms "
                     f"lat={latency_ms:.0f}ms fps={fps:.2f} ram={ram_mb:.0f}MB"
                 )
 
                 batch_id += 1
-                prev_batch_end = batch_end
-
                 input_image = []
                 pbar.update(batch_size)
             else:
                 continue
+
         pending_edge_metrics = self._drain_edge_publish_metrics(pending_edge_metrics, block=True)
         self._close_publisher()
         with open(self._timing_log_edge, "a") as _tf:
@@ -552,7 +578,7 @@ class Scheduler:
                 if mode == "only_edge":
                     decode_ms = 0.0
                     inference_ms = 0.0
-                # ===== ONLY CLOUD =====
+                # ===== ONLY CLOUD (cloud nhận raw frame, chạy full model) =====
                 elif mode == "only_cloud":
                     _decode_start = time.perf_counter()
                     input_tensor = y["data"]
@@ -602,9 +628,8 @@ class Scheduler:
                 else:
                     _post_start = time.perf_counter()
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
-                    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                    self._update_map(results, batch_id, batch_size, map_results=map_results)
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
+                    self._submit_map_eval(x, results, batch_id, batch_size)
 
                 batch_end = time.perf_counter()
                 cloud_end_wall = time.time()
@@ -865,6 +890,9 @@ class Scheduler:
         print(f"  [SYSTEM TOTAL FPS] {system_fps} fps  (sum of avg fps across {len(set(r.get('device_seq') for r in final_rows))} final device(s))")
         print("=" * 50)
         Log.print_with_color(f"Saved {out_path} ({n_rows} batches)", "green")
+        # Cho cac job mAP chay nen (xem _submit_map_eval) hoan tat truoc khi in
+        # ket qua mAP cuoi cung, vi cac job nay khong con dong bo voi batch loop.
+        self._map_executor.shutdown(wait=True)
         n_edge_devices = len(set(r.get("device_seq") for r in edge_rows))
         if n_edge_devices > 1:
             Log.print_with_color(

@@ -74,7 +74,7 @@ class RpcClient:
                 save_set = get_save_set(layers)  # None → yolo26 fallback, set → dynamic routing
 
                 if mode in ("only_edge", "only_cloud"):
-                    client = layers
+                    client = layers  # full model
                 elif self.layer_id == 1:
                     client = layers[:splits]
                 else:

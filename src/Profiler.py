@@ -146,3 +146,59 @@ def measure_bandwidth(channel, client_id: str,
         "cyan"
     )
     return bw
+
+
+def measure_compression_rate(role: str, batch_size: int = 32, num_bits: int = 8,
+                             target_mb: float = 30.0, runs: int = 5) -> float:
+    """
+    Do toc do nen/giai nen Q-DeltaMask THAT tren chinh thiet bi nay (CPU rieng
+    cua may, khac nhau giua tung loai may bien/cloud).
+
+    role="edge"  -> do thoi gian Encoder() (nen)   -> tra encode_rate (ms/MB)
+    role="cloud" -> do thoi gian Decoder() (giai nen) -> tra decode_rate (ms/MB)
+
+    Dung tensor mo phong khung hinh video THAT (khung sau = khung truoc +
+    nhieu nho, KHONG dung torch.randn doc lap tung khung) vi Q-DeltaMask delta-
+    encode theo chieu batch - nhieu doc lap se pha vo gia dinh tuong quan thoi
+    gian, cho ra so do sai (xem thao luan da chot trong du an).
+    Da verify qua nhieu kich thuoc (12-89 MB): ti le ms/MB on dinh (tuyen tinh
+    theo kich thuoc), nen chi can do 1 lan o target_mb roi dung truc tiep cho
+    moi cut khac (nhan voi cut_data_sizes[cut]).
+    """
+    import time
+    from src.Compress import Encoder, Decoder
+
+    if role not in ("edge", "cloud"):
+        raise ValueError(f"role phai la 'edge' hoac 'cloud', nhan duoc {role!r}")
+
+    rng = np.random.default_rng(0)
+    n_elements = int((target_mb * 1024 * 1024) / batch_size / 1.3)
+    base = rng.standard_normal(n_elements).astype(np.float32)
+    frames = [base]
+    for _ in range(batch_size - 1):
+        frames.append(frames[-1] + rng.standard_normal(n_elements).astype(np.float32) * 0.01)
+    tensor = np.stack(frames).reshape(batch_size, n_elements)
+    data_output = [tensor]
+
+    samples = []
+    for _ in range(runs):
+        if role == "edge":
+            t0 = time.perf_counter()
+            encoded, shapes = Encoder(data_output, num_bits=num_bits)
+            elapsed_s = time.perf_counter() - t0
+        else:
+            encoded, shapes = Encoder(data_output, num_bits=num_bits)
+            t0 = time.perf_counter()
+            _ = Decoder(encoded, shapes)
+            elapsed_s = time.perf_counter() - t0
+        actual_mb = sum(len(e) for e in encoded if e is not None) / (1024 * 1024)
+        samples.append((elapsed_s * 1000.0) / actual_mb)
+
+    rate = float(np.median(samples))
+    label = "Encode" if role == "edge" else "Decode"
+    Log.print_with_color(
+        f"[Compress] {label} rate ({role}): {rate:.3f} ms/MB  "
+        f"(samples: {[f'{s:.3f}' for s in samples]}, target={target_mb} MB x{runs})",
+        "magenta"
+    )
+    return rate

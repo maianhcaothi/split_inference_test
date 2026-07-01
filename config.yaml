@@ -40,7 +40,7 @@ multithreading:
 
 backpressure:
   enable: True            # edge dừng gửi khi intermediate_queue quá sâu → chống tràn RAM broker
-  max_queue: 20           # ngưỡng độ sâu queue (số message) cho mode split; only_cloud dùng cap riêng (15)
+  max_queue: 10           # ngưỡng độ sâu queue (số message) cho mode split; only_cloud dùng cap riêng (15)
 
 detections:
   save_json: True         # ghi detections.json khi kết thúc (đọc streaming từ jsonl → RAM phẳng). False = bỏ qua.

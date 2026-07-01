@@ -34,6 +34,10 @@ clustering:
   measure_bandwidth: True # True → đo thực tế mỗi lần chạy; False → dùng network_rate_mb_s cố định
   profile_source: real     # auto → dùng real nếu có, không thì simulated; real → ép dùng real; simulated → ép dùng giả lập
 
+multithreading:
+  enable: True            # chỉ hoạt động ở mode: split. Mỗi device chạy 2 luồng pipeline.
+  queue_size: 4           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device)
+
 adaptive:
   enable: True            # chỉ hoạt động ở mode: split. Server nudge cut point theo độ sâu queue.
   batches_per_check: 20   # N: đánh giá lại sau mỗi N batch được xử lý (đếm qua management API)
@@ -44,3 +48,6 @@ adaptive:
   poll_interval_s: 0.25   # chu kỳ lấy mẫu queue depth trong một window
   step: 1                 # số layer dịch chuyển mỗi lần điều chỉnh
   cooldown_batches: 20    # số batch tối thiểu giữa 2 lần điều chỉnh (chống dao động)
+  max_message_mb: 15.0    # KHÔNG chuyển cut tới điểm có feature map ước tính > ngưỡng này (đệm dưới
+                          # max_message_size của RabbitMQ, mặc định broker 16MB). Nếu tăng broker limit
+                          # thì tăng luôn giá trị này để controller được phép dùng các cut lớn hơn.

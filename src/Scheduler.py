@@ -2,6 +2,8 @@ import torch
 import cv2
 import pickle
 import traceback
+import threading
+import queue as _queue
 from tqdm import tqdm
 import time
 import csv
@@ -19,6 +21,10 @@ from src.Model import inference, postprocess_yolo
 # sends small compressed feature maps and has never overflowed, so it's
 # left unconstrained.
 MAX_QUEUE_ONLY_CLOUD = 15
+
+# Sentinel returned by non-blocking gets when the queue is empty. Distinct from
+# None, which is the stream-end sentinel put into the pipeline queues.
+_MT_EMPTY = object()
 
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
@@ -48,6 +54,12 @@ class Scheduler:
         self.current_cut = None
         self.ctrl_queue = None
         self._L = None
+
+        # Multithreading pipeline (split mode): 1 inference thread + 1 transfer
+        # thread per device, handed off through a bounded in-process queue.
+        self.mt_on = False
+        self.mt_queue_size = 4
+        self._mt_stop = threading.Event()
 
         self.map_metric = None
         self.gt_dict = {}
@@ -447,6 +459,12 @@ class Scheduler:
         cap.release()
         pbar.close()
 
+        self._finish_edge()
+
+    def _finish_edge(self):
+        """Broadcast this edge's metrics CSV to the cluster, tell the server this
+        edge is done, then block until the server replies STOP. Shared by the
+        sequential (first_layer) and threaded (_first_layer_mt) edge paths."""
         # Broadcast metrics CSV lên tất cả cloud trong cluster qua fanout exchange
         metrics_file = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
         if os.path.exists(metrics_file):
@@ -630,6 +648,352 @@ class Scheduler:
         except Exception:
             pass
         pbar.close()
+
+    # ─── Multithreading pipeline (split mode): infer thread ‖ transfer thread ──
+
+    def _mt_put(self, q, item):
+        """Bounded put that yields to the stop event so a dead peer can't deadlock."""
+        while not self._mt_stop.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return True
+            except _queue.Full:
+                continue
+        return False
+
+    def _mt_get(self, q):
+        """Blocking get that returns None once the stream ends or the peer stopped."""
+        while True:
+            try:
+                return q.get(timeout=0.2)
+            except _queue.Empty:
+                if self._mt_stop.is_set():
+                    return None
+                continue
+
+    def _mt_put_nowait(self, q, item):
+        try:
+            q.put_nowait(item)
+            return True
+        except _queue.Full:
+            return False
+
+    def _mt_get_nowait(self, q):
+        try:
+            return q.get_nowait()
+        except _queue.Empty:
+            return _MT_EMPTY
+
+    def _first_layer_mt(self, model, data, batch_size, splits, logger, compress, save_set=None):
+        """Edge, split mode, pipelined with 2 threads:
+          - transfer thread (this/main thread, owns the pika channel): captures
+            video frames -> in_q, and drains out_q -> compress + publish + ctrl poll.
+          - inference thread: pure compute, in_q -> head model -> out_q.
+        Two bounded queues + non-blocking multiplex on the transfer side so a slow
+        network (out_q full) can't deadlock a full in_q."""
+        model.eval()
+        model.to(self.device)
+
+        if self.adaptive_on:
+            self._L = len(model)
+            self.current_cut = max(1, min(int(splits) if splits else 1, self._L - 1))
+            self.ctrl_queue = f"ctrl_{self.client_id}"
+            self.channel.queue_declare(self.ctrl_queue, durable=False)
+            Log.print_with_color(
+                f"[Adaptive][edge] enabled, L={self._L}, start cut={self.current_cut}", "cyan")
+
+        cap = cv2.VideoCapture(data)
+        if not cap.isOpened():
+            Log.print_with_color("Not open video", "red")
+            return False
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        self._mt_stop = threading.Event()
+        in_q = _queue.Queue(maxsize=self.mt_queue_size)
+        out_q = _queue.Queue(maxsize=self.mt_queue_size)
+        with open(self._timing_log_edge, "w") as _tf:
+            print(str(time.time_ns()) + " start", file=_tf)
+
+        infer_t = threading.Thread(
+            target=self._edge_infer_worker,
+            args=(model, in_q, out_q, width, height, splits, save_set),
+            daemon=True)
+        infer_t.start()
+        # Transfer loop (capture + send) runs in THIS (main) thread — owns the channel.
+        self._edge_transfer_worker(cap, in_q, out_q, batch_size, compress, splits)
+        infer_t.join()
+
+        with open(self._timing_log_edge, "a") as _tf:
+            print(str(time.time_ns()) + " end", file=_tf)
+        print(f'size message: {self.size_message} bytes.')
+        cap.release()
+        self._finish_edge()
+
+    def _edge_transfer_worker(self, cap, in_q, out_q, batch_size, compress, splits):
+        """I/O thread: reads/preprocesses frames into batches (in_q) and, in the
+        same loop, publishes finished head outputs pulled from out_q."""
+        pbar = tqdm(desc="Processing video (edge-mt)", unit="frame")
+        frames = []
+        video_done = False
+        in_sentinel_sent = False
+        batch_id = 0
+        prev_done = None
+        try:
+            # Loop until the inference thread's None sentinel arrives on out_q.
+            # (Do NOT guard on _mt_stop here — the inference thread sets stop right
+            #  after emitting its sentinel, and we must still drain the tail of out_q.)
+            while True:
+                progressed = False
+
+                # ---- INPUT: capture one frame, emit a batch when full ----
+                if not in_sentinel_sent:
+                    if not video_done and len(frames) < batch_size:
+                        ret, frame = cap.read()
+                        if not ret:
+                            video_done = True
+                        else:
+                            frame = cv2.resize(frame, (640, 640)).astype('float32') / 255.0
+                            frames.append(torch.from_numpy(frame).permute(2, 0, 1))
+                            progressed = True
+                    if len(frames) == batch_size:
+                        item = (time.perf_counter(), time.time(), torch.stack(frames))
+                        if self._mt_put_nowait(in_q, item):
+                            frames = []
+                            progressed = True
+                    if video_done and len(frames) < batch_size:
+                        # Drop the final partial batch (matches the sequential path)
+                        # and signal end-of-input to the inference thread.
+                        if self._mt_put_nowait(in_q, None):
+                            in_sentinel_sent = True
+                            progressed = True
+
+                # ---- OUTPUT: publish one finished head output if ready ----
+                out = self._mt_get_nowait(out_q)
+                if out is not _MT_EMPTY:
+                    if out is None:
+                        break   # inference thread finished — all outputs drained
+                    self._edge_publish(out, batch_id, batch_size, compress, splits, prev_done, pbar)
+                    batch_id += 1
+                    prev_done = out["_done"]
+                    progressed = True
+                elif in_sentinel_sent and self._mt_stop.is_set():
+                    break   # safety valve: peer stopped abnormally, nothing left to drain
+
+                if not progressed:
+                    time.sleep(0.002)
+        except Exception as e:
+            Log.print_with_color(f"[edge-mt][transfer] {e!r}", "yellow")
+            traceback.print_exc()
+        finally:
+            self._mt_stop.set()
+            pbar.close()
+
+    def _edge_publish(self, out, batch_id, batch_size, compress, splits, prev_done, pbar):
+        batch_start   = out["batch_start"]
+        edge_start_wall = out["edge_start_wall"]
+        inference_ms  = out["inference_ms"]
+        cut           = out["cut"]
+        payload       = out["payload"]
+
+        if self.adaptive_on:
+            self._poll_ctrl()   # updates self.current_cut for FUTURE batches
+            edge_best_cut = int(cut)
+        else:
+            edge_best_cut = "N/A" if splits is None else splits
+
+        _send = time.perf_counter()
+        self.send_next_layer(self.intermediate_queue, payload, compress)
+        send_ms = (time.perf_counter() - _send) * 1000
+
+        done = time.perf_counter()
+        out["_done"] = done
+        latency_ms = (done - batch_start) * 1000
+        fps = batch_size / (done - prev_done) if prev_done is not None else 0.0
+        ram_mb = self.get_ram_mb()
+        msg_size = self.size_message if self.size_message is not None else 0
+
+        self.write_metrics(
+            mode="split", role="edge", best_cut=edge_best_cut,
+            batch_id=batch_id, batch_size=batch_size,
+            latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
+            message_size_bytes=msg_size, e2e_latency_ms=0.0,
+            edge_start_time=edge_start_wall)
+        Log.print_with_color(
+            f"[Timing][edge-mt] infer={inference_ms:.1f}ms send={send_ms:.1f}ms "
+            f"latency={latency_ms:.1f}ms cut={edge_best_cut}", "magenta")
+        pbar.update(batch_size)
+
+    def _edge_infer_worker(self, model, in_q, out_q, width, height, splits, save_set):
+        """Pure compute thread: batch (CPU) -> H2D -> head model -> D2H -> out_q."""
+        try:
+            while True:
+                item = self._mt_get(in_q)
+                if item is None:
+                    break
+                batch_start, edge_start_wall, x_in = item
+                x_in = x_in.to(self.device)
+
+                if self.adaptive_on:
+                    cut = self.current_cut
+                    sub_model = model[:cut]
+                else:
+                    cut = splits
+                    sub_model = model
+
+                _inf = time.perf_counter()
+                y = []
+                with torch.no_grad():
+                    x, y = inference(sub_model, x_in, y, 0, save_set)
+                y[-1] = x
+                # Move to CPU here so the transfer thread does no GPU work.
+                y = [(t.detach().cpu() if isinstance(t, torch.Tensor) else None) for t in y]
+                inference_ms = (time.perf_counter() - _inf) * 1000
+
+                payload = {"data": y, "width": width, "height": height,
+                           "edge_start_time": edge_start_wall}
+                if self.adaptive_on:
+                    payload["cut"] = int(cut)
+
+                out = {"batch_start": batch_start, "edge_start_wall": edge_start_wall,
+                       "inference_ms": inference_ms, "cut": cut, "payload": payload}
+                if not self._mt_put(out_q, out):
+                    break
+        except Exception as e:
+            Log.print_with_color(f"[edge-mt][infer] {e!r}", "yellow")
+            traceback.print_exc()
+        finally:
+            self._mt_put(out_q, None)   # sentinel
+            self._mt_stop.set()
+
+    def _last_layer_mt(self, model, batch_size, splits, logger, compress, save_set=None):
+        """Cloud, split mode, pipelined: transfer thread (recv + decompress) hands
+        each batch to the inference thread (H2D copy + tail model + postprocess)."""
+        model.eval()
+        model.to(self.device)
+
+        self._mt_stop = threading.Event()
+        local_q = _queue.Queue(maxsize=self.mt_queue_size)
+        with open(self._timing_log_cloud, "w") as _tf:
+            print(str(time.time_ns()) + " start", file=_tf)
+
+        infer_t = threading.Thread(
+            target=self._cloud_infer_worker,
+            args=(model, batch_size, splits, save_set, local_q),
+            daemon=True)
+        infer_t.start()
+        # Receive loop runs in THIS (main) thread — it owns the pika channel.
+        self._cloud_recv_worker(local_q, splits, compress)
+        infer_t.join()
+
+        with open(self._timing_log_cloud, "a") as _tf:
+            print(str(time.time_ns()) + " end", file=_tf)
+
+    def _cloud_recv_worker(self, local_q, splits, compress):
+        try:
+            while True:
+                method_frame, header_frame, body = self.channel.basic_get(
+                    queue=self.intermediate_queue, auto_ack=True)
+                if method_frame and body:
+                    received_message_size = len(body)
+                    received_data = pickle.loads(body)
+                    y = received_data["data"]
+                    edge_start_time = y.get("edge_start_time", time.time())
+                    if self.adaptive_on:
+                        cut = int(y.get("cut", splits if splits is not None else 1))
+                    else:
+                        cut = splits
+
+                    _dec = time.perf_counter()
+                    if compress["enable"]:
+                        y["data"] = Decoder(y["data"], y["shape"])
+                        y["data"] = [torch.from_numpy(t) if t is not None else None
+                                     for t in y["data"]]
+                    # Leave tensors on CPU; inference thread does the H2D copy.
+                    decode_ms = (time.perf_counter() - _dec) * 1000
+
+                    if not self._mt_put(local_q, (received_message_size, y, edge_start_time, cut, decode_ms)):
+                        break
+                else:
+                    m2, h2, b2 = self.channel.basic_get(
+                        queue=f'reply_{self.client_id}', auto_ack=True)
+                    if b2:
+                        rd = pickle.loads(b2)
+                        Log.print_with_color(f"[<<<] Received message from server {rd}", "blue")
+                        if rd.get("action") == "STOP":
+                            Log.print_with_color("[>>>] Finish!", "red")
+                            break
+                    else:
+                        time.sleep(0.5)
+        except Exception as e:
+            Log.print_with_color(f"[cloud-mt][recv] {e!r}", "yellow")
+            traceback.print_exc()
+        finally:
+            self._mt_put(local_q, None)   # sentinel
+            self._mt_stop.set()
+
+    def _cloud_infer_worker(self, model, batch_size, splits, save_set, local_q):
+        pbar = tqdm(desc="Processing video (cloud-mt)", unit="frame")
+        batch_id = 0
+        prev_done = None
+        try:
+            while True:
+                item = self._mt_get(local_q)
+                if item is None:
+                    break
+                received_message_size, y, edge_start_time, cut, decode_ms = item
+
+                t0 = time.perf_counter()
+                y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
+                list_output = y["data"]
+                x = list_output[-1]
+
+                if self.adaptive_on:
+                    use_cut = cut
+                    sub_model = model[use_cut:]
+                    cloud_best_cut = use_cut
+                else:
+                    use_cut = splits
+                    sub_model = model
+                    cloud_best_cut = "N/A" if splits is None else splits
+
+                with torch.no_grad():
+                    x, _ = inference(sub_model, x, list_output, use_cut, save_set)
+
+                results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
+                map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                self._update_map(results, batch_id, batch_size, map_results=map_results)
+
+                done = time.perf_counter()
+                cloud_end_wall = time.time()
+                latency_ms = (done - t0) * 1000
+                fps = batch_size / (done - prev_done) if prev_done is not None else 0.0
+                e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
+                ram_mb = self.get_ram_mb()
+
+                self.write_metrics(
+                    mode="split", role="cloud", best_cut=cloud_best_cut,
+                    batch_id=batch_id, batch_size=batch_size,
+                    latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
+                    message_size_bytes=received_message_size,
+                    e2e_latency_ms=e2e_latency_ms, edge_start_time=edge_start_time)
+                Log.print_with_color(
+                    f"[Timing][cloud-mt] decode={decode_ms:.1f}ms infer+post={latency_ms:.1f}ms "
+                    f"e2e={e2e_latency_ms:.1f}ms cut={cloud_best_cut}", "magenta")
+
+                batch_id += 1
+                prev_done = done
+                pbar.update(batch_size)
+        except Exception as e:
+            Log.print_with_color(f"[cloud-mt][infer] {e!r}", "yellow")
+            traceback.print_exc()
+        finally:
+            self._mt_stop.set()
+            pbar.close()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     def middle_layer(self, model):
         pass
@@ -823,16 +1187,24 @@ class Scheduler:
                 pass
             method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None):
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None):
         adaptive = adaptive or {}
+        multithreading = multithreading or {}
         self.adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
+        self.mt_on = bool(multithreading.get("enable", False)) and mode == "split"
+        self.mt_queue_size = int(multithreading.get("queue_size", 4))
+        if self.mt_on:
+            Log.print_with_color(f"[Pipeline] multithreading ON (queue_size={self.mt_queue_size})", "cyan")
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False)
 
         if self.layer_id == 1:
             try:
-                self.first_layer(model, data, batch_size, splits, logger, compress, mode, save_set)
+                if self.mt_on:
+                    self._first_layer_mt(model, data, batch_size, splits, logger, compress, save_set)
+                else:
+                    self.first_layer(model, data, batch_size, splits, logger, compress, mode, save_set)
             except Exception as e:
                 Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
                 traceback.print_exc()
@@ -841,7 +1213,10 @@ class Scheduler:
         elif self.layer_id == num_layers:
             self._setup_metrics_fanout_queue()
             try:
-                self.last_layer(model, batch_size, splits, logger, compress, mode, save_set)
+                if self.mt_on:
+                    self._last_layer_mt(model, batch_size, splits, logger, compress, save_set)
+                else:
+                    self.last_layer(model, batch_size, splits, logger, compress, mode, save_set)
             except Exception as e:
                 Log.print_with_color(f"[!] Error during inference: {e!r} — saving metrics anyway.", "yellow")
                 traceback.print_exc()

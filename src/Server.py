@@ -52,9 +52,11 @@ class Server:
         # Adaptive split-point controller (Mechanic 1). Runtime state built in
         # notify_clients once cut assignments are known.
         self.adaptive_cfg = config.get("adaptive", {})
+        self.multithreading_cfg = config.get("multithreading", {})
         self.cluster_state = {}       # {queue_name: {"queue", "cut", "edges": [client_id,...]}}
         self._num_layers = None       # L, total model layers (for clamping the cut)
         self._adaptive_thread = None
+        self._cut_sizes = None        # per-cut estimated message size (MB), size guard
 
         credentials = pika.PlainCredentials(self.username, self.password)
         self.connection = pika.BlockingConnection(
@@ -220,12 +222,41 @@ class Server:
         # Keep the server's tracked cut in the same [1, L-1] range the edge clamps to.
         for st in self.cluster_state.values():
             st["cut"] = max(1, min(int(st["cut"]), self._num_layers - 1))
+
+        # Per-cut estimated message size (MB), so the controller never moves the cut
+        # to a point whose feature map would exceed the broker's max_message_size.
+        try:
+            self._cut_sizes = get_cut_data_sizes(self.model_name, self.batch_size)
+        except Exception as e:
+            src.Log.print_with_color(f"[Adaptive] cut-size table unavailable ({e}); size guard off", "yellow")
+            self._cut_sizes = None
+        cap = float(self.adaptive_cfg.get("max_message_mb", 15.0))
+        for q, st in self.cluster_state.items():
+            est = self._cut_msg_mb(st["cut"])
+            if est is not None and est > cap:
+                src.Log.print_with_color(
+                    f"[Adaptive] WARNING: initial cut={st['cut']} for {q} est ~{est:.1f}MB > cap {cap}MB. "
+                    f"First send may exceed the broker limit — raise RabbitMQ max_message_size "
+                    f"and adaptive.max_message_mb, or lower batch-size.", "red")
+
         self._adaptive_thread = threading.Thread(target=self._adaptive_loop, daemon=True)
         self._adaptive_thread.start()
         src.Log.print_with_color(
             f"[Adaptive] controller started for {len(self.cluster_state)} cluster(s), "
-            f"L={self._num_layers}, initial cuts="
+            f"L={self._num_layers}, cap={cap}MB, initial cuts="
             f"{ {q: s['cut'] for q, s in self.cluster_state.items()} }", "green")
+
+    def _cut_msg_mb(self, cut):
+        """Estimated intermediate-message size (MB) when the edge runs `cut` layers,
+        from the model's cut-size table. Returns None if unknown. The table is
+        indexed by solver cut = splits-1 (see get_cut_data_sizes)."""
+        sizes = getattr(self, "_cut_sizes", None)
+        if sizes is None:
+            return None
+        idx = int(cut) - 1
+        if 0 <= idx < len(sizes):
+            return float(sizes[idx])
+        return None
 
     def _queue_stats(self, queue_name):
         """Return (depth, cumulative_batch_count) for a queue via the RabbitMQ
@@ -260,6 +291,7 @@ class Server:
         low_r    = float(cfg.get("low_ratio", 0.6))
         step     = int(cfg.get("step", 1))
         cooldown = int(cfg.get("cooldown_batches", 20))
+        cap      = float(cfg.get("max_message_mb", 15.0))
         min_cut, max_cut = 1, self._num_layers - 1
 
         credentials = pika.PlainCredentials(self.username, self.password)
@@ -299,6 +331,15 @@ class Server:
                     new = min(cur + step, max_cut)
                 elif low_frac >= low_r and cur > min_cut:
                     new = max(cur - step, min_cut)
+
+                # Size guard: never move to a cut whose feature map would blow the
+                # broker's max_message_size (which force-closes the channel).
+                if new != cur:
+                    est = self._cut_msg_mb(new)
+                    if est is not None and est > cap:
+                        src.Log.print_with_color(
+                            f"[Adaptive] {q}: cut {cur}->{new} BLOCKED (est ~{est:.1f}MB > cap {cap}MB)", "yellow")
+                        new = cur
 
                 if new != cur and (count - last_change[q]) >= cooldown:
                     st["cut"] = new
@@ -512,6 +553,7 @@ class Server:
                     "compress":   self.compress,
                     "mode":       self._get_mode(),
                     "adaptive":   self.adaptive_cfg,
+                    "multithreading": self.multithreading_cfg,
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 

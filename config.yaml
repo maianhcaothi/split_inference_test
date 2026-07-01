@@ -33,3 +33,14 @@ clustering:
   network_rate_mb_s: 100.0
   measure_bandwidth: True # True → đo thực tế mỗi lần chạy; False → dùng network_rate_mb_s cố định
   profile_source: real     # auto → dùng real nếu có, không thì simulated; real → ép dùng real; simulated → ép dùng giả lập
+
+adaptive:
+  enable: True            # chỉ hoạt động ở mode: split. Server nudge cut point theo độ sâu queue.
+  batches_per_check: 20   # N: đánh giá lại sau mỗi N batch được xử lý (đếm qua management API)
+  high_threshold: 8       # queue depth >= giá trị này → coi là "overflow"
+  low_threshold: 1        # queue depth <= giá trị này → coi là "empty"
+  high_ratio: 0.6         # >=60% mẫu trong window là overflow → cut sâu hơn (edge làm nhiều hơn)
+  low_ratio: 0.6          # >=60% mẫu trong window là empty    → cut nông hơn (cloud làm nhiều hơn)
+  poll_interval_s: 0.25   # chu kỳ lấy mẫu queue depth trong một window
+  step: 1                 # số layer dịch chuyển mỗi lần điều chỉnh
+  cooldown_batches: 20    # số batch tối thiểu giữa 2 lần điều chỉnh (chống dao động)

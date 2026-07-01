@@ -2,7 +2,9 @@ import numpy as np
 import os
 import sys
 import glob
+import time
 import base64
+import threading
 import pika
 import pickle
 import src.Model
@@ -46,6 +48,13 @@ class Server:
         self.total_clients = config["server"]["clients"]
         self.cut_layer = config["server"]["cut-layer"]
         self.batch_size = config["server"]["batch-size"]
+
+        # Adaptive split-point controller (Mechanic 1). Runtime state built in
+        # notify_clients once cut assignments are known.
+        self.adaptive_cfg = config.get("adaptive", {})
+        self.cluster_state = {}       # {queue_name: {"queue", "cut", "edges": [client_id,...]}}
+        self._num_layers = None       # L, total model layers (for clamping the cut)
+        self._adaptive_thread = None
 
         credentials = pika.PlainCredentials(self.username, self.password)
         self.connection = pika.BlockingConnection(
@@ -168,6 +177,155 @@ class Server:
         self.channel.start_consuming()
         self.connection.close()
         sys.exit(0)
+
+    # ─── Adaptive split-point controller (Mechanic 1) ──────────────────────────
+
+    def _count_layers(self):
+        """Total layer count L of the model (cut is clamped to [1, L-1])."""
+        try:
+            import torch
+            ckpt = torch.load(f"{self.model_name}.pt", map_location="cpu", weights_only=False)
+            n = len(ckpt["model"].model)
+            del ckpt
+            return int(n)
+        except Exception as e:
+            src.Log.print_with_color(f"[Adaptive] could not count layers: {e}", "yellow")
+            return None
+
+    def _build_cluster_state(self, mode, clients_to_notify, splits):
+        """Group edge clients by their intermediate queue and record the initial
+        cut, so the controller can nudge each cluster independently."""
+        self.cluster_state = {}
+        if mode in ("only_edge", "only_cloud") or not self.adaptive_cfg.get("enable", False):
+            return
+
+        for (client_id, layer_id) in clients_to_notify:
+            if layer_id != 1:
+                continue
+            assign = self.client_assignments.get(client_id, {})
+            queue = assign.get("queue_name", "intermediate_queue")
+            cut = assign.get("splits", splits)
+            if cut is None:
+                continue
+            st = self.cluster_state.setdefault(queue, {"queue": queue, "cut": int(cut), "edges": []})
+            st["edges"].append(client_id)
+
+    def _start_adaptive_controller(self):
+        if not self.cluster_state:
+            return
+        self._num_layers = self._count_layers()
+        if not self._num_layers:
+            src.Log.print_with_color("[Adaptive] disabled (layer count unknown)", "yellow")
+            return
+        # Keep the server's tracked cut in the same [1, L-1] range the edge clamps to.
+        for st in self.cluster_state.values():
+            st["cut"] = max(1, min(int(st["cut"]), self._num_layers - 1))
+        self._adaptive_thread = threading.Thread(target=self._adaptive_loop, daemon=True)
+        self._adaptive_thread.start()
+        src.Log.print_with_color(
+            f"[Adaptive] controller started for {len(self.cluster_state)} cluster(s), "
+            f"L={self._num_layers}, initial cuts="
+            f"{ {q: s['cut'] for q, s in self.cluster_state.items()} }", "green")
+
+    def _queue_stats(self, queue_name):
+        """Return (depth, cumulative_batch_count) for a queue via the RabbitMQ
+        management HTTP API, or (None, None) if unavailable. Batch count uses
+        message publish stats (one publish == one edge batch)."""
+        import requests
+        from requests.auth import HTTPBasicAuth
+        from urllib.parse import quote
+        url = (f"http://{self.address}:15672/api/queues/"
+               f"{quote(self.virtual_host, safe='')}/{quote(queue_name, safe='')}")
+        try:
+            r = requests.get(url, auth=HTTPBasicAuth(self.username, self.password), timeout=2)
+            if r.status_code != 200:
+                return None, None
+            data = r.json()
+            depth = int(data.get("messages", 0) or 0)
+            stats = data.get("message_stats", {}) or {}
+            count = stats.get("publish")
+            if count is None:
+                count = stats.get("get_no_ack", stats.get("deliver_get", 0))
+            return depth, int(count or 0)
+        except Exception:
+            return None, None
+
+    def _adaptive_loop(self):
+        cfg = self.adaptive_cfg
+        poll     = float(cfg.get("poll_interval_s", 0.25))
+        N        = int(cfg.get("batches_per_check", 20))
+        high_t   = int(cfg.get("high_threshold", 8))
+        low_t    = int(cfg.get("low_threshold", 1))
+        high_r   = float(cfg.get("high_ratio", 0.6))
+        low_r    = float(cfg.get("low_ratio", 0.6))
+        step     = int(cfg.get("step", 1))
+        cooldown = int(cfg.get("cooldown_batches", 20))
+        min_cut, max_cut = 1, self._num_layers - 1
+
+        credentials = pika.PlainCredentials(self.username, self.password)
+        try:
+            conn = pika.BlockingConnection(pika.ConnectionParameters(
+                host=self.address, port=5672, virtual_host=f"{self.virtual_host}",
+                credentials=credentials, heartbeat=0, blocked_connection_timeout=600))
+            ch = conn.channel()
+        except Exception as e:
+            src.Log.print_with_color(f"[Adaptive] control connection failed, controller off: {e}", "yellow")
+            return
+
+        samples      = {q: [] for q in self.cluster_state}
+        baseline     = {q: None for q in self.cluster_state}   # batch count at window start
+        last_change  = {q: None for q in self.cluster_state}   # batch count at last cut change
+
+        while not self._stopping:
+            time.sleep(poll)
+            for q, st in self.cluster_state.items():
+                depth, count = self._queue_stats(q)
+                if depth is None:
+                    continue
+                samples[q].append(depth)
+                if baseline[q] is None:
+                    baseline[q] = count
+                if last_change[q] is None:
+                    last_change[q] = count
+                if count - baseline[q] < N:
+                    continue
+
+                window = samples[q]
+                high_frac = sum(1 for d in window if d >= high_t) / len(window)
+                low_frac  = sum(1 for d in window if d <= low_t) / len(window)
+                cur = st["cut"]
+                new = cur
+                if high_frac >= high_r and cur < max_cut:
+                    new = min(cur + step, max_cut)
+                elif low_frac >= low_r and cur > min_cut:
+                    new = max(cur - step, min_cut)
+
+                if new != cur and (count - last_change[q]) >= cooldown:
+                    st["cut"] = new
+                    last_change[q] = count
+                    self._broadcast_setcut(ch, st["edges"], q, cur, new, high_frac, low_frac)
+
+                samples[q] = []
+                baseline[q] = count
+
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _broadcast_setcut(self, ch, edges, queue, old_cut, new_cut, high_frac, low_frac):
+        for eid in edges:
+            ctrl_q = f"ctrl_{eid}"
+            try:
+                ch.queue_declare(ctrl_q, durable=False)
+                ch.basic_publish(exchange='', routing_key=ctrl_q,
+                                 body=pickle.dumps({"action": "SET_CUT", "cut": int(new_cut)}))
+            except Exception as e:
+                src.Log.print_with_color(f"[Adaptive] SET_CUT publish failed for {eid}: {e}", "yellow")
+        direction = "deeper (edge+)" if new_cut > old_cut else "shallower (cloud+)"
+        src.Log.print_with_color(
+            f"[Adaptive] {queue}: cut {old_cut}->{new_cut} {direction} "
+            f"(high={high_frac:.2f} low={low_frac:.2f})", "green")
 
     def _run_hungarian(self):
         cfg = self.config.get("clustering", {})
@@ -337,6 +495,8 @@ class Server:
                 f"Sending model {self.model_name} to {len(clients_to_notify)} clients "
                 f"(list_clients={len(self.list_clients)}).", "green")
 
+            self._build_cluster_state(mode, clients_to_notify, splits)
+
             for (client_id, layer_id) in clients_to_notify:
                 assignment = self.client_assignments.get(client_id, {})
                 response = {
@@ -351,8 +511,11 @@ class Server:
                     "data":       self.data,
                     "compress":   self.compress,
                     "mode":       self._get_mode(),
+                    "adaptive":   self.adaptive_cfg,
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
+
+            self._start_adaptive_controller()
         else:
             response = {"action": "STOP", "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:

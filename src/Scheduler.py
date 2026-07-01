@@ -42,6 +42,13 @@ class Scheduler:
         self.channel.queue_declare(self.intermediate_queue, durable=False)
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
+        # Adaptive split-point (Mechanic 1). When on, the model is held whole and
+        # the cut is applied per-batch; the edge follows SET_CUT from the server.
+        self.adaptive_on = False
+        self.current_cut = None
+        self.ctrl_queue = None
+        self._L = None
+
         self.map_metric = None
         self.gt_dict = {}
         self._det_results = {}
@@ -258,6 +265,15 @@ class Scheduler:
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+
+        if self.adaptive_on:
+            self._L = len(model)
+            self.current_cut = max(1, min(int(splits) if splits else 1, self._L - 1))
+            self.ctrl_queue = f"ctrl_{self.client_id}"
+            self.channel.queue_declare(self.ctrl_queue, durable=False)
+            Log.print_with_color(
+                f"[Adaptive][edge] enabled, L={self._L}, start cut={self.current_cut}", "cyan")
+
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
@@ -270,6 +286,8 @@ class Scheduler:
             input_image.append(tensor)
 
             if len(input_image) == batch_size:
+                if self.adaptive_on:
+                    self._poll_ctrl()
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
                 with open(self._timing_log_edge, "a") as _tf:
@@ -288,6 +306,7 @@ class Scheduler:
                 inference_ms = 0.0
                 queue_wait_ms = 0.0
                 send_ms = 0.0
+                edge_best_cut = "N/A" if splits is None else splits  # overridden per-batch when adaptive
 
                 # ===== ONLY CLOUD =====
                 if mode == "only_cloud":
@@ -350,10 +369,17 @@ class Scheduler:
                 # ===== SPLIT INFERENCE =====
                 else:
 
+                    if self.adaptive_on:
+                        cut = self.current_cut
+                        sub_model = model[:cut]      # full model held; slice per-batch
+                    else:
+                        cut = splits
+                        sub_model = model            # already sliced at load time
+
                     _inf_start = time.perf_counter()
                     y = []
                     with torch.no_grad():
-                        x, y = inference(model, input_image, y, 0, save_set)
+                        x, y = inference(sub_model, input_image, y, 0, save_set)
                     y[-1] = x
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
@@ -363,6 +389,9 @@ class Scheduler:
                         "height": height,
                         "edge_start_time": edge_start_wall
                     }
+                    if self.adaptive_on:
+                        y["cut"] = int(cut)
+                        edge_best_cut = int(cut)
 
                     _send_start = time.perf_counter()
                     self.send_next_layer(
@@ -384,7 +413,7 @@ class Scheduler:
                 self.write_metrics(
                     mode=mode,
                     role="edge_sender" if mode == "only_cloud" else "edge",
-                    best_cut="N/A" if splits is None else splits,
+                    best_cut=edge_best_cut,
                     batch_id=batch_id,
                     batch_size=batch_size,
                     latency_ms=latency_ms,
@@ -475,6 +504,7 @@ class Scheduler:
                 received_data = pickle.loads(body)
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
+                cloud_best_cut = "N/A" if splits is None else splits  # overridden per-batch when adaptive
 
                 # ===== ONLY EDGE (cloud just receives lightweight results) =====
                 if mode == "only_edge":
@@ -516,9 +546,19 @@ class Scheduler:
                     x = list_output[-1]
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
 
+                    if self.adaptive_on:
+                        # Cut travels inside the message; the edge held layers[:cut]
+                        # so this device runs the matching tail layers[cut:].
+                        cut = int(y.get("cut", splits if splits is not None else 1))
+                        sub_model = model[cut:]      # full model held; slice per-batch
+                        cloud_best_cut = cut
+                    else:
+                        cut = splits
+                        sub_model = model            # already sliced at load time
+
                     _inf_start = time.perf_counter()
                     with torch.no_grad():
-                        x, _ = inference(model, x, list_output, splits, save_set)
+                        x, _ = inference(sub_model, x, list_output, cut, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
                 if mode == "only_edge":
@@ -545,7 +585,7 @@ class Scheduler:
                 self.write_metrics(
                     mode=mode,
                     role="cloud",
-                    best_cut="N/A" if splits is None else splits,
+                    best_cut=cloud_best_cut,
                     batch_id=batch_id,
                     batch_size=batch_size,
                     latency_ms=latency_ms,
@@ -766,7 +806,26 @@ class Scheduler:
         if self._det_results:
             self._write_detections_json()
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None):
+    def _poll_ctrl(self):
+        """Edge: drain SET_CUT control messages from the server, applying the
+        latest requested cut (clamped to [1, L-1])."""
+        method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
+        while body:
+            try:
+                msg = pickle.loads(body)
+                if msg.get("action") == "SET_CUT":
+                    new_cut = max(1, min(int(msg["cut"]), self._L - 1))
+                    if new_cut != self.current_cut:
+                        Log.print_with_color(
+                            f"[Adaptive][edge] cut {self.current_cut} -> {new_cut}", "cyan")
+                        self.current_cut = new_cut
+            except Exception:
+                pass
+            method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
+
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None):
+        adaptive = adaptive or {}
+        self.adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False)

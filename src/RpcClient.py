@@ -43,6 +43,8 @@ class RpcClient:
             data = self.response["data"]
             compress = self.response["compress"]
             mode = self.response.get("mode", "split")
+            adaptive = self.response.get("adaptive", {}) or {}
+            adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
 
             if model is not None:
                 file_path = f'{model_name}.pt'
@@ -75,6 +77,10 @@ class RpcClient:
 
                 if mode in ("only_edge", "only_cloud"):
                     client = layers
+                elif adaptive_on:
+                    # Adaptive: both edge and cloud hold the FULL model; the cut is
+                    # applied per-batch (Scheduler) so it can move at runtime.
+                    client = layers
                 elif self.layer_id == 1:
                     client = layers[:splits]
                 else:
@@ -85,7 +91,7 @@ class RpcClient:
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set)
+            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive)
 
             return False
         else:

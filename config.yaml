@@ -2,8 +2,8 @@ name: YOLO
 server:
   cut-layer: a # or b, c, d
   clients:
-    - 1 #edge
-    - 1 #cloud
+    - 9 #edge
+    - 3 #cloud
   model: yolo26n
   batch-size: 32
 experiment:
@@ -11,9 +11,9 @@ experiment:
   mode: only_cloud
   #mode: only_edge
 rabbit:
-  address: localhost
-  username: guest
-  password: guest
+  address: 192.168.101.91
+  username: "machine-1"
+  password: "123456"
   virtual-host: /
 
 debug-mode: False
@@ -37,6 +37,13 @@ clustering:
 multithreading:
   enable: True            # chỉ hoạt động ở mode: split. Mỗi device chạy 2 luồng pipeline.
   queue_size: 4           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device)
+
+backpressure:
+  enable: True            # edge dừng gửi khi intermediate_queue quá sâu → chống tràn RAM broker
+  max_queue: 20           # ngưỡng độ sâu queue (số message) cho mode split; only_cloud dùng cap riêng (15)
+
+detections:
+  save_json: True         # ghi detections.json khi kết thúc (đọc streaming từ jsonl → RAM phẳng). False = bỏ qua.
 
 adaptive:
   enable: True            # chỉ hoạt động ở mode: split. Server nudge cut point theo độ sâu queue.

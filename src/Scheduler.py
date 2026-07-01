@@ -61,9 +61,18 @@ class Scheduler:
         self.mt_queue_size = 4
         self._mt_stop = threading.Event()
 
+        # Broker back-pressure (RAM guard): stall the edge when its intermediate
+        # queue gets too deep so messages can't pile up in the broker.
+        self.backpressure_on = False
+        self.backpressure_max = MAX_QUEUE_ONLY_CLOUD
+
         self.map_metric = None
         self.gt_dict = {}
-        self._det_results = {}
+        # Detections are streamed to detections_stream.jsonl during the run (flat
+        # RAM); detections.json is rebuilt from that file at the end. Keep only a
+        # count in RAM, not every frame's boxes.
+        self.save_detections_json = True
+        self._det_count = 0
         self._map_updated = False
         self._load_gt_dict()
 
@@ -82,15 +91,16 @@ class Scheduler:
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
 
-    def _check_backpressure(self):
-        max_queue = MAX_QUEUE_ONLY_CLOUD
+    def _check_backpressure(self, max_queue):
+        """Stall the caller while the intermediate queue is at/above max_queue, so
+        the edge can't outrun the cloud and flood the broker (RAM guard)."""
         depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         if depth < max_queue:
             return
 
         Log.print_with_color(
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={max_queue}, waiting", "yellow")
-        while depth >= max_queue:
+        while depth >= max_queue and not self._mt_stop.is_set():
             time.sleep(0.1)
             depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         Log.print_with_color(
@@ -219,7 +229,9 @@ class Scheduler:
                 }
                 for i in range(len(r["boxes"]))
             ]
-            self._det_results[frame_num] = dets
+            # Stream to disk instead of holding every frame's boxes in RAM. RAM
+            # stays flat over long videos; detections.json is rebuilt at the end.
+            self._det_count += 1
             with open("detections_stream.jsonl", "a") as f:
                 f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
             if self.map_metric is None or frame_num not in self.gt_dict:
@@ -247,11 +259,35 @@ class Scheduler:
             Log.print_with_color(f"[mAP] compute failed: {e}", "red")
 
     def _write_detections_json(self):
+        """Rebuild detections.json ({frame: dets}) by streaming detections_stream.jsonl
+        line by line, so peak RAM stays flat regardless of video length. (tracker
+        post-mode looks up frames by key, so ordering is irrelevant.)"""
         import json
+        if not self.save_detections_json:
+            return
+        stream = "detections_stream.jsonl"
         out = "detections.json"
-        with open(out, "w") as f:
-            json.dump({str(k): v for k, v in sorted(self._det_results.items())}, f)
-        Log.print_with_color(f"[Tracker] Saved {out} ({len(self._det_results)} frames)", "green")
+        if not os.path.exists(stream):
+            return
+        n = 0
+        with open(stream) as fin, open(out, "w") as fout:
+            fout.write("{")
+            first = True
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if not first:
+                    fout.write(",")
+                fout.write(f"{json.dumps(str(entry['frame']))}:{json.dumps(entry['dets'])}")
+                first = False
+                n += 1
+            fout.write("}")
+        Log.print_with_color(f"[Tracker] Saved {out} ({n} frames, streamed)", "green")
 
     def send_to_server(self, message):
         self.channel.queue_declare('rpc_queue', durable=False)
@@ -333,7 +369,7 @@ class Scheduler:
                     _wait_start = time.perf_counter()
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_start", file=_tf)
-                    self._check_backpressure()
+                    self._check_backpressure(MAX_QUEUE_ONLY_CLOUD)
                     with open(self._timing_log_edge, "a") as _tf:
                         print(str(time.time_ns()) + " queue_wait_end", file=_tf)
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
@@ -404,6 +440,11 @@ class Scheduler:
                     if self.adaptive_on:
                         y["cut"] = int(cut)
                         edge_best_cut = int(cut)
+
+                    if self.backpressure_on:
+                        _wait_start = time.perf_counter()
+                        self._check_backpressure(self.backpressure_max)
+                        queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
                     self.send_next_layer(
@@ -802,6 +843,9 @@ class Scheduler:
         else:
             edge_best_cut = "N/A" if splits is None else splits
 
+        if self.backpressure_on:
+            self._check_backpressure(self.backpressure_max)
+
         _send = time.perf_counter()
         self.send_next_layer(self.intermediate_queue, payload, compress)
         send_ms = (time.perf_counter() - _send) * 1000
@@ -1167,7 +1211,7 @@ class Scheduler:
         elif self._map_updated:
             self._print_map()
 
-        if self._det_results:
+        if self.save_detections_json and self._det_count > 0:
             self._write_detections_json()
 
     def _poll_ctrl(self):
@@ -1187,14 +1231,23 @@ class Scheduler:
                 pass
             method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None):
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None):
         adaptive = adaptive or {}
         multithreading = multithreading or {}
+        backpressure = backpressure or {}
+        detections = detections or {}
         self.adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
         self.mt_on = bool(multithreading.get("enable", False)) and mode == "split"
         self.mt_queue_size = int(multithreading.get("queue_size", 4))
+        # Back-pressure: split uses the configurable cap; only_cloud keeps its own
+        # tuned cap (large raw messages) inside its branch.
+        self.backpressure_on = bool(backpressure.get("enable", False)) and mode == "split"
+        self.backpressure_max = int(backpressure.get("max_queue", 20))
+        self.save_detections_json = bool(detections.get("save_json", True))
         if self.mt_on:
             Log.print_with_color(f"[Pipeline] multithreading ON (queue_size={self.mt_queue_size})", "cyan")
+        if self.backpressure_on:
+            Log.print_with_color(f"[BackPressure] split-mode guard ON (max_queue={self.backpressure_max})", "cyan")
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False)

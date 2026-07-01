@@ -53,6 +53,8 @@ class Server:
         # notify_clients once cut assignments are known.
         self.adaptive_cfg = config.get("adaptive", {})
         self.multithreading_cfg = config.get("multithreading", {})
+        self.backpressure_cfg = config.get("backpressure", {})
+        self.detections_cfg = config.get("detections", {})
         self.cluster_state = {}       # {queue_name: {"queue", "cut", "edges": [client_id,...]}}
         self._num_layers = None       # L, total model layers (for clamping the cut)
         self._adaptive_thread = None
@@ -258,6 +260,18 @@ class Server:
             return float(sizes[idx])
         return None
 
+    def _nearest_safe_cut(self, cur, direction, step, cap, min_cut, max_cut):
+        """Nearest cut to `cur` in `direction` (+1 deeper / -1 shallower) whose
+        estimated message fits under `cap` MB. Starts `step` away and skips over
+        any unsafe cuts. Returns `cur` if none is safe in that direction."""
+        c = cur + direction * max(1, step)
+        while min_cut <= c <= max_cut:
+            est = self._cut_msg_mb(c)
+            if est is None or est <= cap:
+                return c
+            c += direction
+        return cur
+
     def _queue_stats(self, queue_name):
         """Return (depth, cumulative_batch_count) for a queue via the RabbitMQ
         management HTTP API, or (None, None) if unavailable. Batch count uses
@@ -326,20 +340,22 @@ class Server:
                 high_frac = sum(1 for d in window if d >= high_t) / len(window)
                 low_frac  = sum(1 for d in window if d <= low_t) / len(window)
                 cur = st["cut"]
-                new = cur
+                direction = 0
                 if high_frac >= high_r and cur < max_cut:
-                    new = min(cur + step, max_cut)
+                    direction = +1     # cloud bottleneck -> cut deeper (edge does more)
                 elif low_frac >= low_r and cur > min_cut:
-                    new = max(cur - step, min_cut)
+                    direction = -1     # cloud starved   -> cut shallower (cloud does more)
 
-                # Size guard: never move to a cut whose feature map would blow the
-                # broker's max_message_size (which force-closes the channel).
-                if new != cur:
-                    est = self._cut_msg_mb(new)
-                    if est is not None and est > cap:
+                # Move in the desired direction to the NEAREST cut whose feature map
+                # fits under the broker's max_message_size. Skips over unsafe cuts
+                # (the size profile is non-monotonic) instead of giving up at cur±step.
+                new = cur
+                if direction != 0:
+                    new = self._nearest_safe_cut(cur, direction, step, cap, min_cut, max_cut)
+                    if new == cur:
                         src.Log.print_with_color(
-                            f"[Adaptive] {q}: cut {cur}->{new} BLOCKED (est ~{est:.1f}MB > cap {cap}MB)", "yellow")
-                        new = cur
+                            f"[Adaptive] {q}: want {'deeper' if direction > 0 else 'shallower'} "
+                            f"from cut {cur} but no cut ≤ cap {cap}MB in that direction — staying", "yellow")
 
                 if new != cur and (count - last_change[q]) >= cooldown:
                     st["cut"] = new
@@ -554,6 +570,8 @@ class Server:
                     "mode":       self._get_mode(),
                     "adaptive":   self.adaptive_cfg,
                     "multithreading": self.multithreading_cfg,
+                    "backpressure": self.backpressure_cfg,
+                    "detections": self.detections_cfg,
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 

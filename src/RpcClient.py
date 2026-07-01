@@ -46,6 +46,8 @@ class RpcClient:
             adaptive = self.response.get("adaptive", {}) or {}
             adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
             multithreading = self.response.get("multithreading", {}) or {}
+            backpressure = self.response.get("backpressure", {}) or {}
+            detections = self.response.get("detections", {}) or {}
 
             if model is not None:
                 file_path = f'{model_name}.pt'
@@ -92,7 +94,7 @@ class RpcClient:
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive, multithreading)
+            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive, multithreading, backpressure, detections)
 
             return False
         else:

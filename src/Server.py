@@ -81,6 +81,15 @@ class Server:
         self.channel.queue_declare(queue='intermediate_queue', durable=False)
         self.channel.queue_purge(queue='intermediate_queue')
 
+        # FPS meter: clouds ping 'fps_queue' after each finished batch; we compute
+        # throughput from the gap between consecutive pings (see on_fps). Purge so
+        # a new run doesn't inherit stale pings from a crashed one.
+        self.channel.queue_declare(queue='fps_queue', durable=False)
+        self.channel.queue_purge(queue='fps_queue')
+        self._fps_prev_t = None  # server arrival time of the previous 'done'
+        self._fps_count = 0      # number of fps samples aggregated so far
+        self._fps_sum = 0.0      # running sum of per-batch fps (for the average)
+
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.registered_ids = set()
@@ -94,6 +103,7 @@ class Server:
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
+        self.channel.basic_consume(queue='fps_queue', on_message_callback=self.on_fps)
 
         self.data = config["data"]
         self.compress = config["compress"]
@@ -169,6 +179,26 @@ class Server:
                 self.channel.stop_consuming()
                 return
 
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    def on_fps(self, ch, method, _, body):
+        """Consumer for fps_queue: each 'done' means a cloud finished one batch.
+        FPS is computed entirely server-side from the gap between the arrival
+        times of two consecutive 'done' messages:
+            fps = batch_size / (t_now - t_prev)
+        (batch_size comes from config; the message carries no payload)."""
+        now = time.time()
+        prev = self._fps_prev_t
+        self._fps_prev_t = now
+        if prev is not None and now > prev:
+            fps = self.batch_size / (now - prev)
+            self._fps_count += 1
+            self._fps_sum += fps
+            avg = self._fps_sum / self._fps_count
+            src.Log.print_with_color(
+                f"[FPS] batch done: {fps:6.2f} fps "
+                f"(batch_size={self.batch_size}, gap={(now - prev) * 1000:.1f} ms)  "
+                f"| running avg {avg:6.2f} fps over {self._fps_count} batches", "cyan")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def send_to_response(self, client_id, message):

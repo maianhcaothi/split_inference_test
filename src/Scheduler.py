@@ -48,6 +48,12 @@ class Scheduler:
         self.channel.queue_declare(self.intermediate_queue, durable=False)
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
+        # FPS reporting: the cloud pings 'fps_queue' after each finished batch so
+        # the server (consumer) can compute throughput from the gap between pings,
+        # using the same fps = batch_size / dt formula as last_layer.
+        self.fps_queue = "fps_queue"
+        self._fps_q = None   # thread-safe hand-off, used only by the mt cloud path
+
         # Adaptive split-point (Mechanic 1). When on, the model is held whole and
         # the cut is applied per-batch; the edge follows SET_CUT from the server.
         self.adaptive_on = False
@@ -295,6 +301,34 @@ class Scheduler:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
+    def _send_fps_done(self):
+        """Tell the server (on fps_queue) that the cloud just finished one batch.
+        Only a bare 'done' is sent — the server times the gap between consecutive
+        'done' arrivals itself (fps = batch_size / gap). Must be called on the
+        channel-owning thread."""
+        try:
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=self.fps_queue,
+                body=pickle.dumps({"action": "done"}),
+            )
+        except Exception as e:
+            Log.print_with_color(f"[FPS] send 'done' failed: {e}", "yellow")
+
+    def _drain_fps_events(self):
+        """Publish one 'done' ping per batch finished by the mt inference thread.
+        Runs on the channel-owning (recv) thread because pika channels are not
+        thread-safe — the infer thread only enqueues a marker onto _fps_q."""
+        q = self._fps_q
+        if q is None:
+            return
+        while True:
+            try:
+                q.get_nowait()
+            except _queue.Empty:
+                break
+            self._send_fps_done()
+
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
         if mode != "only_cloud":
@@ -476,16 +510,16 @@ class Scheduler:
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_wall,
                 )
-                write_ms = (time.perf_counter() - _write_start) * 1000
+                # write_ms = (time.perf_counter() - _write_start) * 1000
 
-                batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
-                Log.print_with_color(
-                    f"[Timing][edge] gap={gap_ms:.1f}ms stack={stack_ms:.1f}ms "
-                    f"inference={inference_ms:.1f}ms queue_wait={queue_wait_ms:.1f}ms send={send_ms:.1f}ms "
-                    f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
-                    f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
-                    "magenta"
-                )
+                # batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
+                # Log.print_with_color(
+                #     f"[Timing][edge] gap={gap_ms:.1f}ms stack={stack_ms:.1f}ms "
+                #     f"inference={inference_ms:.1f}ms queue_wait={queue_wait_ms:.1f}ms send={send_ms:.1f}ms "
+                #     f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
+                #     f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
+                #     "magenta"
+                # )
 
                 batch_id += 1
                 prev_batch_end = batch_end
@@ -549,6 +583,7 @@ class Scheduler:
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+        self.channel.queue_declare(self.fps_queue, durable=False)
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         while True:
@@ -654,16 +689,19 @@ class Scheduler:
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_time,
                 )
-                write_ms = (time.perf_counter() - _write_start) * 1000
+                # write_ms = (time.perf_counter() - _write_start) * 1000
 
-                batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
-                Log.print_with_color(
-                    f"[Timing][cloud] gap={gap_ms:.1f}ms decode={decode_ms:.1f}ms "
-                    f"inference={inference_ms:.1f}ms postprocess={postprocess_ms:.1f}ms "
-                    f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
-                    f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
-                    "magenta"
-                )
+                # batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
+                # Log.print_with_color(
+                #     f"[Timing][cloud] gap={gap_ms:.1f}ms decode={decode_ms:.1f}ms "
+                #     f"inference={inference_ms:.1f}ms postprocess={postprocess_ms:.1f}ms "
+                #     f"ram={ram_ms:.1f}ms write={write_ms:.1f}ms "
+                #     f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
+                #     "magenta"
+                # )
+
+                # Ping the server that one batch finished (server-side FPS meter).
+                self._send_fps_done()
 
                 batch_id += 1
                 prev_batch_end = batch_end
@@ -918,6 +956,8 @@ class Scheduler:
 
         self._mt_stop = threading.Event()
         local_q = _queue.Queue(maxsize=self.mt_queue_size)
+        self.channel.queue_declare(self.fps_queue, durable=False)
+        self._fps_q = _queue.Queue()   # infer thread -> recv thread: fps 'done' pings
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
 
@@ -929,6 +969,7 @@ class Scheduler:
         # Receive loop runs in THIS (main) thread — it owns the pika channel.
         self._cloud_recv_worker(local_q, splits, compress)
         infer_t.join()
+        self._drain_fps_events()   # flush pings for the final in-flight batches
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
@@ -936,6 +977,9 @@ class Scheduler:
     def _cloud_recv_worker(self, local_q, splits, compress):
         try:
             while True:
+                # Publish fps 'done' pings for batches the infer thread finished
+                # (done here because this thread owns the pika channel).
+                self._drain_fps_events()
                 method_frame, header_frame, body = self.channel.basic_get(
                     queue=self.intermediate_queue, auto_ack=True)
                 if method_frame and body:
@@ -1024,6 +1068,11 @@ class Scheduler:
                 Log.print_with_color(
                     f"[Timing][cloud-mt] decode={decode_ms:.1f}ms infer+post={latency_ms:.1f}ms "
                     f"e2e={e2e_latency_ms:.1f}ms cut={cloud_best_cut}", "magenta")
+
+                # Hand this batch's fps 'done' ping to the recv thread to publish
+                # (the recv thread owns the pika channel; this thread must not).
+                if self._fps_q is not None:
+                    self._fps_q.put(1)
 
                 batch_id += 1
                 prev_done = done

@@ -35,6 +35,8 @@ Beyond the basic split, the system automatically **chooses where to cut** for a 
 * [Execution Modes](#execution-modes)
 * [Automatic Partitioning (Hungarian Clustering)](#automatic-partitioning-hungarian-clustering)
 * [Adaptive Split-Point Controller](#adaptive-split-point-controller)
+
+  * [Measured results — dynamic vs static cut](#measured-results--dynamic-vs-static-cut)
 * [Multithreading Pipeline](#multithreading-pipeline)
 * [Feature-Map Compression](#feature-map-compression)
 * [RAM Overflow Protection](#ram-overflow-protection)
@@ -175,6 +177,45 @@ The Hungarian pass picks a good **initial** cut, but the optimum drifts as load/
 **Message-size guard:** shallower cuts produce **larger** feature maps (early layers have big spatial maps). The controller never moves to a cut whose estimated message exceeds `adaptive.max_message_mb`; it **skips over** unsafe cuts to the nearest safe one in the desired direction, and refuses to move if none is safe. This prevents the broker from rejecting an oversized message.
 
 > If you use large batches, raise RabbitMQ's `max_message_size` **and** `adaptive.max_message_mb` together, or lower `batch-size`.
+
+## Measured results — dynamic vs static cut
+
+Same fleet, video, and config (`split` mode, batch-size 32, 252 batches = 8,064 frames); the only difference is whether the runtime controller may move the cut. Numbers from the [System FPS Meter](#system-fps-meter-fps_queue):
+
+| Metric | Static cut | **Dynamic cut** (`adaptive.enable: True`) | Δ |
+|---|---|---|---|
+| **SYSTEM FPS** (START → last DONE) | 29.432 fps | **31.313 fps** | **+6.4 %** |
+| Steady-state FPS (first → last DONE) | 30.335 fps | **32.329 fps** | +6.6 % |
+| Total run time | 273.99 s | **257.53 s** | −16.5 s |
+
+Both runs completed all 252 batches and stopped cleanly (`work queues drained + grace`). Re-balancing the cut at runtime buys **~6–7 % throughput** over holding the cut fixed, with no change to model or hardware.
+
+<details>
+<summary>Raw summaries</summary>
+
+Dynamic (`adaptive.enable: True`):
+
+```
+============================================================
+  [SYSTEM FPS]        31.313 fps   = 252 DONE x 32 / 257.53s  (START -> last DONE)
+  [steady-state]      32.329 fps   = 251 x 32 / 248.45s  (first -> last DONE)
+  [ref mean, N/U]     97.897 fps   (arithmetic mean of 1/dt — reference only, biased high)
+  batches counted: 252   stop reason: work queues drained + grace
+============================================================
+```
+
+Static split:
+
+```
+============================================================
+  [SYSTEM FPS]        29.432 fps   = 252 DONE x 32 / 273.99s  (START -> last DONE)
+  [steady-state]      30.335 fps   = 251 x 32 / 264.77s  (first -> last DONE)
+  [ref mean, N/U]    115.378 fps   (arithmetic mean of 1/dt — reference only, biased high)
+  batches counted: 252   stop reason: work queues drained + grace
+============================================================
+```
+
+</details>
 
 ---
 

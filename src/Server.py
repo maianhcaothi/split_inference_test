@@ -86,9 +86,19 @@ class Server:
         # a new run doesn't inherit stale pings from a crashed one.
         self.channel.queue_declare(queue='fps_queue', durable=False)
         self.channel.queue_purge(queue='fps_queue')
-        self._fps_prev_t = None  # server arrival time of the previous 'done'
-        self._fps_count = 0      # number of fps samples aggregated so far
-        self._fps_sum = 0.0      # running sum of per-batch fps (for the average)
+        self._fps_prev_t = None   # server arrival time of the previous 'done'
+        self._fps_count = 0       # number of fps samples (== #done - 1)
+        self._fps_sum = 0.0       # running sum of per-batch fps (for the mean)
+        self._fps_first_t = None  # arrival time of the very first 'done'
+        self._fps_last_t = None   # arrival time of the most recent 'done'
+        # The server would normally stop the moment all EDGES report done, but the
+        # clouds keep draining the pipeline (and sending 'done') a bit longer. So
+        # we keep the fps meter alive until every cloud has sent 'cloud_done',
+        # with a fallback timer in case a cloud dies. Only then print the summary.
+        self._n_clouds = int(self.total_clients[-1]) if self.total_clients else 0
+        self._clouds_done = 0
+        self._fps_printed = False
+        self._fps_timeout_s = float(config.get("fps", {}).get("shutdown_timeout_s", 300))
 
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
@@ -176,20 +186,57 @@ class Server:
                 self._stopping = True
                 self.notify_clients(start=False)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
-                self.channel.stop_consuming()
+                # Do NOT stop consuming yet: the clouds are still draining the
+                # pipeline and emitting 'done' pings. Keep the fps meter alive
+                # until every cloud reports 'cloud_done' (see on_fps), so the
+                # system throughput is measured over the WHOLE run. Fallback
+                # timer guards against a cloud that dies without reporting.
+                if self._n_clouds <= 0:
+                    self._finish_fps("no clouds to wait for")
+                else:
+                    src.Log.print_with_color(
+                        f"[FPS] all edges done; waiting for {self._n_clouds} cloud(s) "
+                        f"to drain (timeout {self._fps_timeout_s:.0f}s)", "yellow")
+                    try:
+                        self.connection.call_later(
+                            self._fps_timeout_s, lambda: self._finish_fps("timeout"))
+                    except Exception:
+                        pass
                 return
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def on_fps(self, ch, method, _, body):
-        """Consumer for fps_queue: each 'done' means a cloud finished one batch.
-        FPS is computed entirely server-side from the gap between the arrival
-        times of two consecutive 'done' messages:
-            fps = batch_size / (t_now - t_prev)
-        (batch_size comes from config; the message carries no payload)."""
+        """Consumer for fps_queue. Two message kinds:
+          - 'done'      : a cloud finished one batch. System throughput is
+                          computed server-side from the gap between the arrival
+                          times of two consecutive 'done' messages (from any
+                          cloud), fps = batch_size / (t_now - t_prev). With
+                          multiple clouds the merged arrival rate makes this the
+                          aggregate system throughput.
+          - 'cloud_done': a cloud has fully finished. Once all clouds report,
+                          print the mean of the collected FPS and stop."""
+        try:
+            msg = pickle.loads(body)
+            action = msg.get("action") if isinstance(msg, dict) else None
+        except Exception:
+            action = "done"   # tolerate a bare ping
+
+        if action == "cloud_done":
+            self._clouds_done += 1
+            src.Log.print_with_color(
+                f"[FPS] cloud finished ({self._clouds_done}/{self._n_clouds})", "cyan")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            if self._clouds_done >= self._n_clouds:
+                self._finish_fps("all clouds done")
+            return
+
         now = time.time()
         prev = self._fps_prev_t
         self._fps_prev_t = now
+        if self._fps_first_t is None:
+            self._fps_first_t = now
+        self._fps_last_t = now
         if prev is not None and now > prev:
             fps = self.batch_size / (now - prev)
             self._fps_count += 1
@@ -200,6 +247,32 @@ class Server:
                 f"(batch_size={self.batch_size}, gap={(now - prev) * 1000:.1f} ms)  "
                 f"| running avg {avg:6.2f} fps over {self._fps_count} batches", "cyan")
         ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    def _finish_fps(self, reason=""):
+        """Print the system-FPS summary once and stop the server's consumer.
+        Idempotent: safe to call from both the cloud-done path and the fallback
+        timer (whichever fires first wins)."""
+        if self._fps_printed:
+            return
+        self._fps_printed = True
+        print("=" * 50)
+        if self._fps_count > 0:
+            mean = self._fps_sum / self._fps_count
+            print(f"  [SYSTEM FPS]  mean of {self._fps_count} samples = {mean:.3f} fps")
+            if (self._fps_first_t is not None and self._fps_last_t is not None
+                    and self._fps_last_t > self._fps_first_t):
+                span = self._fps_last_t - self._fps_first_t
+                frames = self._fps_count * self.batch_size
+                print(f"  [SYSTEM FPS]  overall throughput = {frames / span:.3f} fps "
+                      f"({frames} frames / {span:.2f}s)")
+        else:
+            print("  [SYSTEM FPS]  no 'done' pings received — nothing to report")
+        print(f"  [SYSTEM FPS]  stop reason: {reason}")
+        print("=" * 50)
+        try:
+            self.channel.stop_consuming()
+        except Exception:
+            pass
 
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"

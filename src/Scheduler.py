@@ -329,6 +329,19 @@ class Scheduler:
                 break
             self._send_fps_done()
 
+    def _send_fps_cloud_done(self):
+        """Tell the server this cloud has fully finished (sent after all 'done'
+        pings), so the server knows when it can stop the fps meter and print the
+        system summary instead of cutting off when the edges finish."""
+        try:
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=self.fps_queue,
+                body=pickle.dumps({"action": "cloud_done"}),
+            )
+        except Exception as e:
+            Log.print_with_color(f"[FPS] send 'cloud_done' failed: {e}", "yellow")
+
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
         if mode != "only_cloud":
@@ -720,6 +733,10 @@ class Scheduler:
                 else:
                     time.sleep(0.5)
 
+        # All batches processed and STOP received: tell the server this cloud is
+        # fully done so it can finalize the system-FPS summary.
+        self._send_fps_cloud_done()
+
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
         try:
@@ -969,7 +986,8 @@ class Scheduler:
         # Receive loop runs in THIS (main) thread — it owns the pika channel.
         self._cloud_recv_worker(local_q, splits, compress)
         infer_t.join()
-        self._drain_fps_events()   # flush pings for the final in-flight batches
+        self._drain_fps_events()     # flush pings for the final in-flight batches
+        self._send_fps_cloud_done()  # then tell the server this cloud is fully done
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)

@@ -22,6 +22,7 @@ Beyond the basic split, the system automatically **chooses where to cut** for a 
 | **RAM overflow protection** | Broker back-pressure (edge stalls when the queue is too deep) + bounded pipeline queues + flat-RAM detection streaming. |
 | **Real profiling & bandwidth** | Per-layer timing (CUDA events / perf-counter) and live uplink bandwidth measurement feed the partitioner. |
 | **Metrics & mAP** | Per-batch latency / FPS / RAM / message size / end-to-end latency CSV, plus optional mAP against ground truth. |
+| **System FPS meter** | Server measures whole-run throughput over a dedicated `fps_queue` (one `DONE` per finished batch) as frames/time — robust to bursty arrivals and aggregated across a multi-cluster fleet. |
 | **Tracker / visualization** | Render detections onto the video in real time or after the run. |
 
 ---
@@ -37,6 +38,7 @@ Beyond the basic split, the system automatically **chooses where to cut** for a 
 * [Multithreading Pipeline](#multithreading-pipeline)
 * [Feature-Map Compression](#feature-map-compression)
 * [RAM Overflow Protection](#ram-overflow-protection)
+* [System FPS Meter](#system-fps-meter-fps_queue)
 * [Project Structure](#project-structure)
 * [How to Run](#how-to-run)
 
@@ -226,6 +228,30 @@ The system bounds memory at every stage so long runs / fast edges can't blow up 
 
 ---
 
+# System FPS Meter (fps_queue)
+
+Alongside the per-device FPS in the metrics CSV, the server measures **whole-system throughput** live over a dedicated queue, giving one authoritative number for the run no matter how many edges / clouds / clusters are involved (`src/Scheduler.py`, `src/Server.py`).
+
+**Mechanism:**
+
+* **One `DONE` per batch.** Whichever tier *completes* a batch publishes a bare `b"DONE"` to `fps_queue` — the **cloud** in `split` / `only_cloud`, the **edge** in `only_edge`. Never both, so one `DONE` = exactly `batch_size` frames. With Hungarian clustering every cluster's cloud publishes to the *same* `fps_queue`, so the count is aggregated across the whole fleet.
+* **Server records arrival times.** The server consumes `fps_queue` and appends `time.time()` for every `DONE`. All math uses the server's own clock, so device clock skew is irrelevant — and the message body is never read: the *arrival* is the event.
+* **Keeps collecting past edge shutdown.** When all edges report done the server does **not** exit — the clouds are still draining their backlog. It keeps consuming `fps_queue` while the work queues (`intermediate_queue_k`) still hold batches, plus a short **grace** (`fps.grace_s`, default 10 s) for the last in-flight batch, so late `DONE`s from cloud backlog are still counted. A hard cap (`fps.shutdown_timeout_s`) prevents hanging if a peer dies mid-drain.
+
+**Formulas** (printed in the final summary; `N` = number of `DONE`s):
+
+| Number | Formula | Meaning |
+|---|---|---|
+| **SYSTEM FPS** | `N × batch_size / (START broadcast → last DONE)` | true whole-run throughput, warm-up included |
+| steady-state FPS | `(N−1) × batch_size / (first DONE → last DONE)` | throughput excluding warm-up — best for comparing modes / cut-points |
+| window_fps (live log) | `15 × batch_size / (span of last 16 DONEs)` | smoothed live view while the run is going |
+
+The `(N−1)` in steady-state is because the first `DONE` only starts the clock — its batch finished before the measured span began.
+
+> **Why frames/time, not the mean of `1/Δt`.** `DONE`s arrive in bursts (several 0.1 s gaps → ~300 fps entries, then one 5 s gap → a single ~6 fps entry), so averaging per-gap fps over-weights the bursts and reads far too high (e.g. 102 fps when the real rate is 26.6). Dividing total frames by total time weights every second of the run equally — the actual definition of throughput. The old mean is still printed, but labeled *reference only*.
+
+---
+
 # Project Structure
 
 ```
@@ -350,6 +376,10 @@ backpressure:
 detections:
   save_json: True         # write detections.json at the end (streamed → flat RAM)
 
+fps:                      # optional — system FPS meter (defaults shown)
+  grace_s: 10             # keep collecting DONEs this long after the work queues drain
+  shutdown_timeout_s: 300 # hard cap so a dead peer can't hang the server
+
 adaptive:
   enable: True            # split mode: server nudges the cut based on queue depth
   batches_per_check: 20   # evaluate every N batches
@@ -472,6 +502,8 @@ fps = batch_size / (batch_end - prev_batch_end)
 `prev_batch_end` is the finish time of the previous batch on the same device, so FPS reflects how many frames that device completes per second between two consecutive batches. The first batch of every device always reports **0.0** because there is no previous batch to compare against.
 
 The **total system FPS** is the sum of the per-device average FPS across all final devices (cloud devices in split/only-cloud mode, edge devices in only-edge mode), since all final devices process frames in parallel. The first-batch **0.0** values are excluded from the per-device average so they do not distort the result.
+
+> This CSV figure is the *per-device* view. For an independent, whole-run throughput number measured directly by the server, see [System FPS Meter](#system-fps-meter-fps_queue).
 
 ## RAM
 

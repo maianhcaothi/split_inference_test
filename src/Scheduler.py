@@ -48,9 +48,9 @@ class Scheduler:
         self.channel.queue_declare(self.intermediate_queue, durable=False)
         self._my_metrics_queue = None  # set by _setup_metrics_fanout_queue
 
-        # FPS reporting: the cloud pings 'fps_queue' after each finished batch so
-        # the server (consumer) can compute throughput from the gap between pings,
-        # using the same fps = batch_size / dt formula as last_layer.
+        # FPS reporting: whichever tier finishes a batch publishes one bare b"DONE"
+        # to 'fps_queue' (cloud in split/only_cloud, edge in only_edge — never
+        # both). The server counts arrivals and derives system throughput.
         self.fps_queue = "fps_queue"
         self._fps_q = None   # thread-safe hand-off, used only by the mt cloud path
 
@@ -302,23 +302,24 @@ class Scheduler:
                                    body=pickle.dumps(message))
 
     def _send_fps_done(self):
-        """Tell the server (on fps_queue) that the cloud just finished one batch.
-        Only a bare 'done' is sent — the server times the gap between consecutive
-        'done' arrivals itself (fps = batch_size / gap). Must be called on the
-        channel-owning thread."""
+        """Publish exactly one bare b"DONE" to fps_queue per finished batch. The
+        tier that COMPLETES the batch sends it (cloud in split/only_cloud, edge in
+        only_edge) — never both, so one DONE == exactly batch_size frames. The
+        server never reads the body; the arrival itself is the event. Must be
+        called on the channel-owning thread (pika channels aren't thread-safe)."""
         try:
             self.channel.basic_publish(
                 exchange='',
                 routing_key=self.fps_queue,
-                body=pickle.dumps({"action": "done"}),
+                body=b"DONE",
             )
         except Exception as e:
-            Log.print_with_color(f"[FPS] send 'done' failed: {e}", "yellow")
+            Log.print_with_color(f"[FPS] send DONE failed: {e}", "yellow")
 
     def _drain_fps_events(self):
-        """Publish one 'done' ping per batch finished by the mt inference thread.
-        Runs on the channel-owning (recv) thread because pika channels are not
-        thread-safe — the infer thread only enqueues a marker onto _fps_q."""
+        """Publish one DONE per batch finished by the mt inference thread. Runs on
+        the channel-owning (recv) thread because pika channels are not thread-safe
+        — the infer thread only enqueues a marker onto _fps_q."""
         q = self._fps_q
         if q is None:
             return
@@ -328,19 +329,6 @@ class Scheduler:
             except _queue.Empty:
                 break
             self._send_fps_done()
-
-    def _send_fps_cloud_done(self):
-        """Tell the server this cloud has fully finished (sent after all 'done'
-        pings), so the server knows when it can stop the fps meter and print the
-        system summary instead of cutting off when the edges finish."""
-        try:
-            self.channel.basic_publish(
-                exchange='',
-                routing_key=self.fps_queue,
-                body=pickle.dumps({"action": "cloud_done"}),
-            )
-        except Exception as e:
-            Log.print_with_color(f"[FPS] send 'cloud_done' failed: {e}", "yellow")
 
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
@@ -360,6 +348,11 @@ class Scheduler:
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+
+        # In only_edge the edge is the tier that completes each batch, so it (not
+        # the cloud) publishes the DONE ping — declare the queue up front.
+        if mode == "only_edge":
+            self.channel.queue_declare(self.fps_queue, durable=False)
 
         if self.adaptive_on:
             self._L = len(model)
@@ -533,6 +526,11 @@ class Scheduler:
                 #     f"| latency={latency_ms:.1f}ms | batch_interval={batch_interval_ms:.1f}ms",
                 #     "magenta"
                 # )
+
+                # only_edge: the edge completes the batch here, so it emits the DONE
+                # (in split/only_cloud the cloud does it instead — never both).
+                if mode == "only_edge":
+                    self._send_fps_done()
 
                 batch_id += 1
                 prev_batch_end = batch_end
@@ -713,8 +711,10 @@ class Scheduler:
                 #     "magenta"
                 # )
 
-                # Ping the server that one batch finished (server-side FPS meter).
-                self._send_fps_done()
+                # One DONE per completed batch. In only_edge the EDGE completes the
+                # batch and sends DONE, so the cloud must not (avoid double count).
+                if mode != "only_edge":
+                    self._send_fps_done()
 
                 batch_id += 1
                 prev_batch_end = batch_end
@@ -732,10 +732,6 @@ class Scheduler:
                         break
                 else:
                     time.sleep(0.5)
-
-        # All batches processed and STOP received: tell the server this cloud is
-        # fully done so it can finalize the system-FPS summary.
-        self._send_fps_cloud_done()
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
@@ -986,8 +982,7 @@ class Scheduler:
         # Receive loop runs in THIS (main) thread — it owns the pika channel.
         self._cloud_recv_worker(local_q, splits, compress)
         infer_t.join()
-        self._drain_fps_events()     # flush pings for the final in-flight batches
-        self._send_fps_cloud_done()  # then tell the server this cloud is fully done
+        self._drain_fps_events()   # flush DONEs for the final in-flight batches
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)

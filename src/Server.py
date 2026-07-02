@@ -81,24 +81,26 @@ class Server:
         self.channel.queue_declare(queue='intermediate_queue', durable=False)
         self.channel.queue_purge(queue='intermediate_queue')
 
-        # FPS meter: clouds ping 'fps_queue' after each finished batch; we compute
-        # throughput from the gap between consecutive pings (see on_fps). Purge so
-        # a new run doesn't inherit stale pings from a crashed one.
+        # FPS meter: whichever tier finishes a batch publishes one bare b"DONE" to
+        # 'fps_queue'. We record the ARRIVAL TIME of every DONE (server clock only,
+        # so device clock skew is irrelevant) and derive system throughput from
+        # frames/time. Purge so a new run doesn't inherit stale DONEs.
         self.channel.queue_declare(queue='fps_queue', durable=False)
         self.channel.queue_purge(queue='fps_queue')
-        self._fps_prev_t = None   # server arrival time of the previous 'done'
-        self._fps_count = 0       # number of fps samples (== #done - 1)
-        self._fps_sum = 0.0       # running sum of per-batch fps (for the mean)
-        self._fps_first_t = None  # arrival time of the very first 'done'
-        self._fps_last_t = None   # arrival time of the most recent 'done'
-        # The server would normally stop the moment all EDGES report done, but the
-        # clouds keep draining the pipeline (and sending 'done') a bit longer. So
-        # we keep the fps meter alive until every cloud has sent 'cloud_done',
-        # with a fallback timer in case a cloud dies. Only then print the summary.
-        self._n_clouds = int(self.total_clients[-1]) if self.total_clients else 0
-        self._clouds_done = 0
+        self._fps_times = []       # arrival time of every DONE (one per batch)
+        self._fps_start_t = None   # when START was broadcast (system-fps t0)
         self._fps_printed = False
-        self._fps_timeout_s = float(config.get("fps", {}).get("shutdown_timeout_s", 300))
+        # Shutdown: after the edges finish the clouds keep draining their backlog,
+        # so we DON'T exit on edge-done. We keep collecting while the work queues
+        # still hold batches, plus a short grace for the last in-flight batch. A
+        # hard cap guards against a peer that dies without draining.
+        fps_cfg = config.get("fps", {})
+        self._fps_grace_s = float(fps_cfg.get("grace_s", 10.0))
+        self._fps_hardcap_s = float(fps_cfg.get("shutdown_timeout_s", 300))
+        self._fps_stop_bcast_t = None   # when all edges reported done
+        self._fps_empty_since = None    # when work queues were first seen empty
+        self._fps_work_queues = set()   # queues whose depth we watch while draining
+        self._fps_window = 16           # DONEs per live smoothed window_fps sample
 
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
@@ -186,89 +188,126 @@ class Server:
                 self._stopping = True
                 self.notify_clients(start=False)
                 ch.basic_ack(delivery_tag=method.delivery_tag)
-                # Do NOT stop consuming yet: the clouds are still draining the
-                # pipeline and emitting 'done' pings. Keep the fps meter alive
-                # until every cloud reports 'cloud_done' (see on_fps), so the
-                # system throughput is measured over the WHOLE run. Fallback
-                # timer guards against a cloud that dies without reporting.
-                if self._n_clouds <= 0:
-                    self._finish_fps("no clouds to wait for")
-                else:
-                    src.Log.print_with_color(
-                        f"[FPS] all edges done; waiting for {self._n_clouds} cloud(s) "
-                        f"to drain (timeout {self._fps_timeout_s:.0f}s)", "yellow")
-                    try:
-                        self.connection.call_later(
-                            self._fps_timeout_s, lambda: self._finish_fps("timeout"))
-                    except Exception:
-                        pass
+                # Do NOT stop consuming yet: the clouds are still draining their
+                # backlog and emitting DONEs. Keep the fps meter alive while the
+                # work queues hold batches, plus a grace for the last in-flight
+                # batch, so late DONEs from cloud backlog are still counted.
+                self._fps_stop_bcast_t = time.time()
+                self._fps_work_queues = {
+                    a.get("queue_name", "intermediate_queue")
+                    for a in self.client_assignments.values()
+                } or {"intermediate_queue"}
+                src.Log.print_with_color(
+                    f"[FPS] all edges done; draining {sorted(self._fps_work_queues)} "
+                    f"(grace {self._fps_grace_s:.0f}s, hard cap {self._fps_hardcap_s:.0f}s)",
+                    "yellow")
+                try:
+                    self.connection.call_later(1.0, self._fps_drain_check)
+                except Exception:
+                    self._finish_fps("scheduler unavailable at edge-done")
                 return
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def on_fps(self, ch, method, _, body):
-        """Consumer for fps_queue. Two message kinds:
-          - 'done'      : a cloud finished one batch. System throughput is
-                          computed server-side from the gap between the arrival
-                          times of two consecutive 'done' messages (from any
-                          cloud), fps = batch_size / (t_now - t_prev). With
-                          multiple clouds the merged arrival rate makes this the
-                          aggregate system throughput.
-          - 'cloud_done': a cloud has fully finished. Once all clouds report,
-                          print the mean of the collected FPS and stop."""
-        try:
-            msg = pickle.loads(body)
-            action = msg.get("action") if isinstance(msg, dict) else None
-        except Exception:
-            action = "done"   # tolerate a bare ping
+        """Consumer for fps_queue. Every message is one finished batch — the body
+        (bare b"DONE") is never read; the ARRIVAL is the event. We just record the
+        server-clock arrival time; all throughput math happens in _finish_fps.
+        A smoothed window_fps is logged live so progress is visible during the run."""
+        self._fps_times.append(time.time())
+        n = len(self._fps_times)
+        W = self._fps_window
+        if n >= W:
+            span = self._fps_times[-1] - self._fps_times[-W]
+            if span > 0:
+                window_fps = (W - 1) * self.batch_size / span
+                src.Log.print_with_color(
+                    f"[FPS] DONE #{n}  window_fps={window_fps:6.2f} "
+                    f"(last {W} batches)", "cyan")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
-        if action == "cloud_done":
-            self._clouds_done += 1
-            src.Log.print_with_color(
-                f"[FPS] cloud finished ({self._clouds_done}/{self._n_clouds})", "cyan")
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            if self._clouds_done >= self._n_clouds:
-                self._finish_fps("all clouds done")
+    def _fps_total_work_depth(self):
+        """Total messages still queued across the pipeline's work queues, or None
+        if the broker's management API can't be reached for any of them."""
+        total = 0
+        any_ok = False
+        for q in self._fps_work_queues:
+            depth, _ = self._queue_stats(q)
+            if depth is not None:
+                any_ok = True
+                total += depth
+        return total if any_ok else None
+
+    def _fps_drain_check(self):
+        """Periodic tail-watcher (scheduled once the edges finish). Keeps the fps
+        meter alive while the work queues still hold batches, then finalises after
+        a short grace for the last in-flight batch. A hard cap prevents hanging if
+        a peer dies without draining."""
+        if self._fps_printed:
+            return
+        now = time.time()
+        if self._fps_stop_bcast_t is not None and (now - self._fps_stop_bcast_t) >= self._fps_hardcap_s:
+            self._finish_fps(f"hard cap {self._fps_hardcap_s:.0f}s reached")
             return
 
-        now = time.time()
-        prev = self._fps_prev_t
-        self._fps_prev_t = now
-        if self._fps_first_t is None:
-            self._fps_first_t = now
-        self._fps_last_t = now
-        if prev is not None and now > prev:
-            fps = self.batch_size / (now - prev)
-            self._fps_count += 1
-            self._fps_sum += fps
-            avg = self._fps_sum / self._fps_count
-            src.Log.print_with_color(
-                f"[FPS] batch done: {fps:6.2f} fps "
-                f"(batch_size={self.batch_size}, gap={(now - prev) * 1000:.1f} ms)  "
-                f"| running avg {avg:6.2f} fps over {self._fps_count} batches", "cyan")
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        depth = self._fps_total_work_depth()
+        if depth is None:
+            # No queue stats: fall back to "no DONE for grace seconds".
+            last = self._fps_times[-1] if self._fps_times else self._fps_stop_bcast_t
+            if last is not None and (now - last) >= self._fps_grace_s:
+                self._finish_fps("grace elapsed (no queue stats)")
+                return
+        elif depth > 0:
+            self._fps_empty_since = None   # still draining, reset grace
+        else:
+            if self._fps_empty_since is None:
+                self._fps_empty_since = now
+            elif (now - self._fps_empty_since) >= self._fps_grace_s:
+                self._finish_fps("work queues drained + grace")
+                return
+
+        try:
+            self.connection.call_later(1.0, self._fps_drain_check)
+        except Exception:
+            self._finish_fps("scheduler unavailable")
 
     def _finish_fps(self, reason=""):
         """Print the system-FPS summary once and stop the server's consumer.
-        Idempotent: safe to call from both the cloud-done path and the fallback
-        timer (whichever fires first wins)."""
+        Idempotent — whichever of drain-grace / hard-cap fires first wins."""
         if self._fps_printed:
             return
         self._fps_printed = True
-        print("=" * 50)
-        if self._fps_count > 0:
-            mean = self._fps_sum / self._fps_count
-            print(f"  [SYSTEM FPS]  mean of {self._fps_count} samples = {mean:.3f} fps")
-            if (self._fps_first_t is not None and self._fps_last_t is not None
-                    and self._fps_last_t > self._fps_first_t):
-                span = self._fps_last_t - self._fps_first_t
-                frames = self._fps_count * self.batch_size
-                print(f"  [SYSTEM FPS]  overall throughput = {frames / span:.3f} fps "
-                      f"({frames} frames / {span:.2f}s)")
+
+        t = self._fps_times
+        n = len(t)
+        bs = self.batch_size
+        print("=" * 60)
+        if n >= 1 and self._fps_start_t is not None and t[-1] > self._fps_start_t:
+            # PRIMARY: whole-run throughput. Weights every second equally, so
+            # bursty DONE arrivals can't inflate it (frames / total time).
+            total_time = t[-1] - self._fps_start_t
+            system_fps = n * bs / total_time
+            print(f"  [SYSTEM FPS]      {system_fps:8.3f} fps   "
+                  f"= {n} DONE x {bs} / {total_time:.2f}s  (START -> last DONE)")
+            # Steady-state: drop the warm-up. The first DONE only starts the clock
+            # (its batch finished before the measured span), hence (n-1).
+            if n >= 2 and t[-1] > t[0]:
+                span = t[-1] - t[0]
+                steady = (n - 1) * bs / span
+                print(f"  [steady-state]    {steady:8.3f} fps   "
+                      f"= {n - 1} x {bs} / {span:.2f}s  (first -> last DONE)")
+            # Reference only: mean of per-gap 1/dt fps. Over-weights bursts, so it
+            # reads high vs the true rate — kept for comparison, do not use.
+            if n >= 2:
+                gaps = [t[i] - t[i - 1] for i in range(1, n) if t[i] > t[i - 1]]
+                if gaps:
+                    ref_mean = sum(bs / g for g in gaps) / len(gaps)
+                    print(f"  [ref mean, N/U]   {ref_mean:8.3f} fps   "
+                          f"(arithmetic mean of 1/dt — reference only, biased high)")
         else:
-            print("  [SYSTEM FPS]  no 'done' pings received — nothing to report")
-        print(f"  [SYSTEM FPS]  stop reason: {reason}")
-        print("=" * 50)
+            print("  [SYSTEM FPS]      no DONEs received — nothing to report")
+        print(f"  batches counted: {n}   stop reason: {reason}")
+        print("=" * 60)
         try:
             self.channel.stop_consuming()
         except Exception:
@@ -677,6 +716,10 @@ class Server:
                     "detections": self.detections_cfg,
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
+
+            # t0 for SYSTEM FPS (frames / (START -> last DONE)) — captured right
+            # after the START fan-out, so warm-up is included in the whole-run rate.
+            self._fps_start_t = time.time()
 
             self._start_adaptive_controller()
         else:

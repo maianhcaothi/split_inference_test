@@ -127,6 +127,13 @@ class Server:
         # mixes timestamps with the previous one.
         self.batch_log_path = f"{log_path}/batch_done_ns.log"
         open(self.batch_log_path, "w").close()
+        # One line per adaptive cut change:
+        # "<ns-epoch> <queue>: cut <old>-><new> <deeper|shallower>".
+        # Truncated only when the adaptive controller is enabled, so a
+        # non-adaptive run keeps the previous adaptive run's log intact.
+        self.cut_log_path = f"{log_path}/cut_change_ns.log"
+        if self.adaptive_cfg.get("enable", False):
+            open(self.cut_log_path, "w").close()
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 
@@ -219,14 +226,14 @@ class Server:
         (bare b"DONE") is never read; the ARRIVAL is the event. We just record the
         server-clock arrival time; all throughput math happens in _finish_fps.
         A smoothed window_fps is logged live so progress is visible during the run.
-        Each arrival is also appended to batch_done_ns.log as a bare ns-epoch
-        timestamp, one line per batch."""
+        Each arrival is also appended to batch_done_ns.log as "<ns-epoch> <fps>",
+        one line per batch — the fps column holds the bare window_fps value and
+        is absent until the first full window."""
         t_ns = time.time_ns()
         self._fps_times.append(t_ns / 1e9)
-        with open(self.batch_log_path, "a") as f:
-            f.write(f"{t_ns}\n")
         n = len(self._fps_times)
         W = self._fps_window
+        window_fps = None
         if n >= W:
             span = self._fps_times[-1] - self._fps_times[-W]
             if span > 0:
@@ -234,6 +241,11 @@ class Server:
                 src.Log.print_with_color(
                     f"[FPS] DONE #{n}  window_fps={window_fps:6.2f} "
                     f"(last {W} batches)", "cyan")
+        with open(self.batch_log_path, "a") as f:
+            if window_fps is None:
+                f.write(f"{t_ns}\n")
+            else:
+                f.write(f"{t_ns} {window_fps:.2f}\n")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _fps_total_work_depth(self):
@@ -523,6 +535,7 @@ class Server:
             pass
 
     def _broadcast_setcut(self, ch, edges, queue, old_cut, new_cut, high_frac, low_frac):
+        t_ns = time.time_ns()
         for eid in edges:
             ctrl_q = f"ctrl_{eid}"
             try:
@@ -531,7 +544,10 @@ class Server:
                                  body=pickle.dumps({"action": "SET_CUT", "cut": int(new_cut)}))
             except Exception as e:
                 src.Log.print_with_color(f"[Adaptive] SET_CUT publish failed for {eid}: {e}", "yellow")
-        direction = "deeper (edge+)" if new_cut > old_cut else "shallower (cloud+)"
+        word = "deeper" if new_cut > old_cut else "shallower"
+        with open(self.cut_log_path, "a") as f:
+            f.write(f"{t_ns} {queue}: cut {old_cut}->{new_cut} {word}\n")
+        direction = f"{word} ({'edge+' if new_cut > old_cut else 'cloud+'})"
         src.Log.print_with_color(
             f"[Adaptive] {queue}: cut {old_cut}->{new_cut} {direction} "
             f"(high={high_frac:.2f} low={low_frac:.2f})", "green")

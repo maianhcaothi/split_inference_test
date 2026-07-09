@@ -122,6 +122,11 @@ class Server:
 
         log_path = config["log-path"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
+        # One line per finished batch: ns-epoch arrival time of its DONE
+        # (e.g. 1782962149610671139). Truncated here so a new run never
+        # mixes timestamps with the previous one.
+        self.batch_log_path = f"{log_path}/batch_done_ns.log"
+        open(self.batch_log_path, "w").close()
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 
@@ -213,8 +218,13 @@ class Server:
         """Consumer for fps_queue. Every message is one finished batch — the body
         (bare b"DONE") is never read; the ARRIVAL is the event. We just record the
         server-clock arrival time; all throughput math happens in _finish_fps.
-        A smoothed window_fps is logged live so progress is visible during the run."""
-        self._fps_times.append(time.time())
+        A smoothed window_fps is logged live so progress is visible during the run.
+        Each arrival is also appended to batch_done_ns.log as a bare ns-epoch
+        timestamp, one line per batch."""
+        t_ns = time.time_ns()
+        self._fps_times.append(t_ns / 1e9)
+        with open(self.batch_log_path, "a") as f:
+            f.write(f"{t_ns}\n")
         n = len(self._fps_times)
         W = self._fps_window
         if n >= W:

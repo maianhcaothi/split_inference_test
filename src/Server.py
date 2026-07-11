@@ -87,6 +87,15 @@ class Server:
         # frames/time. Purge so a new run doesn't inherit stale DONEs.
         self.channel.queue_declare(queue='fps_queue', durable=False)
         self.channel.queue_purge(queue='fps_queue')
+
+        # Utilization reports: each device computes ONE whole-run busy/total
+        # ratio from its own timing log and publishes it to 'utilization_queue'
+        # when it finishes. Reports sit on the broker until _collect_utilization
+        # drains them at shutdown (a cloud publishes AFTER rpc_queue consuming
+        # stopped, so a dedicated queue is required). Purge so a new run
+        # discards stale reports from a crashed run.
+        self.channel.queue_declare(queue='utilization_queue', durable=False)
+        self.channel.queue_purge(queue='utilization_queue')
         self._fps_times = []       # arrival time of every DONE (one per batch)
         self._fps_start_t = None   # when START was broadcast (system-fps t0)
         self._fps_printed = False
@@ -127,6 +136,11 @@ class Server:
         # mixes timestamps with the previous one.
         self.batch_log_path = f"{log_path}/batch_done_ns.log"
         open(self.batch_log_path, "w").close()
+        # One line per device: "<ns-epoch arrival> client=... role=... packages=...
+        # busy_s=... total_s=... utilization=...%", appended by
+        # _collect_utilization at shutdown. Truncated here so runs never mix.
+        self.util_log_path = f"{log_path}/utilization.log"
+        open(self.util_log_path, "w").close()
         # One line per adaptive cut change:
         # "<ns-epoch> <queue>: cut <old>-><new> <deeper|shallower>".
         # Truncated only when the adaptive controller is enabled, so a
@@ -335,6 +349,42 @@ class Server:
         except Exception:
             pass
 
+    def _collect_utilization(self, timeout_s=30.0):
+        """Shutdown step: drain every device's UTILIZATION report from
+        utilization_queue and append one line per device to utilization.log.
+        Runs after the FPS drain + summary, so every cloud has already seen STOP
+        and published its report. Polls with basic_get until all registered
+        clients reported or the timeout elapses — a partial collection prints a
+        warning and the run still shuts down cleanly."""
+        expected = len(self.registered_ids)
+        reported = set()
+        deadline = time.time() + timeout_s
+        while len(reported) < expected and time.time() < deadline:
+            method_frame, _, body = self.channel.basic_get(queue='utilization_queue', auto_ack=True)
+            if not method_frame:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if not isinstance(msg, dict) or msg.get("action") != "UTILIZATION":
+                continue
+            t_ns = time.time_ns()   # server-clock arrival timestamp for the log line
+            client_id = msg.get("client_id")
+            reported.add(str(client_id))
+            line = (f"{t_ns} client={client_id} role={msg.get('role')} "
+                    f"packages={msg.get('packages')} "
+                    f"busy_s={msg.get('busy_ns', 0) / 1e9:.3f} "
+                    f"total_s={msg.get('total_ns', 0) / 1e9:.3f} "
+                    f"utilization={msg.get('utilization', 0.0) * 100:.2f}%")
+            with open(self.util_log_path, "a") as f:
+                f.write(line + "\n")
+            src.Log.print_with_color(f"[Utilization] {line}", "cyan")
+        if len(reported) < expected:
+            src.Log.print_with_color(
+                f"[Utilization] Collected {len(reported)}/{expected} reports before timeout", "yellow")
+
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"
         self.reply_channel.queue_declare(reply_queue_name, durable=False)
@@ -343,6 +393,10 @@ class Server:
 
     def start(self):
         self.channel.start_consuming()
+        # start_consuming returns once _finish_fps stopped the consumer (FPS
+        # drain + summary done) — now gather every device's utilization report
+        # before closing the connection.
+        self._collect_utilization()
         self.connection.close()
         sys.exit(0)
 

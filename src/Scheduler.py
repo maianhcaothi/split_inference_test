@@ -54,6 +54,13 @@ class Scheduler:
         self.fps_queue = "fps_queue"
         self._fps_q = None   # thread-safe hand-off, used only by the mt cloud path
 
+        # Utilization: when a device finishes it re-reads its own timing log,
+        # computes ONE whole-run busy/total ratio, and publishes the report to
+        # 'utilization_queue'; the server appends every device's report to
+        # utilization.log during its shutdown collection step.
+        self.utilization_queue = "utilization_queue"
+        self.channel.queue_declare(self.utilization_queue, durable=False)
+
         # Adaptive split-point (Mechanic 1). When on, the model is held whole and
         # the cut is applied per-batch; the edge follows SET_CUT from the server.
         self.adaptive_on = False
@@ -330,6 +337,85 @@ class Scheduler:
                 break
             self._send_fps_done()
 
+    def _compute_utilization(self, log_path, role):
+        """Parse this device's timing log (one "<ns> <event>" line per lifecycle
+        event) into ONE whole-run utilization ratio:
+            utilization = busy / total = sum(output_i - get_input_i) / (end - start)
+        Numerator and denominator come from the same device's own clock, so clock
+        skew between machines cannot distort the ratio. Unknown events (e.g.
+        queue_wait_start/queue_wait_end) are ignored, so the log format stays
+        forward-extensible; an unmatched 'get input' with no following 'output'
+        (crash mid-batch) is dropped. Returns the stats dict, or None if the log
+        is missing or incomplete."""
+        t_start = None
+        t_end = None
+        t_input = None
+        busy_ns = 0
+        n_packages = 0
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    parts = line.strip().split(" ", 1)  # event names contain spaces
+                    if len(parts) != 2 or not parts[0].isdigit():
+                        continue
+                    ts, event = int(parts[0]), parts[1]
+                    if event == "start":
+                        t_start = ts
+                    elif event == "end":
+                        t_end = ts
+                    elif event == "get input":
+                        t_input = ts
+                    elif event == "output":
+                        if t_input is not None:
+                            busy_ns += ts - t_input
+                            n_packages += 1
+                            t_input = None
+        except Exception as e:
+            Log.print_with_color(f"[Utilization] cannot read {log_path}: {e}", "yellow")
+            return None
+        if t_start is None or t_end is None or t_end <= t_start:
+            Log.print_with_color(
+                f"[Utilization] incomplete timing log {log_path} (missing/invalid start-end)", "yellow")
+            return None
+        total_ns = t_end - t_start
+        stats = {
+            "role": role,
+            "packages": n_packages,
+            "busy_ns": busy_ns,
+            "total_ns": total_ns,
+            "utilization": busy_ns / total_ns,
+        }
+        Log.print_with_color(
+            f"[Utilization][{role}] packages={n_packages} "
+            f"busy={busy_ns / 1e9:.3f}s total={total_ns / 1e9:.3f}s "
+            f"utilization={stats['utilization'] * 100:.2f}%", "cyan")
+        return stats
+
+    def _send_utilization(self, stats):
+        """Publish this device's finished utilization report to utilization_queue.
+        The report sits on the broker until the server's shutdown collection step
+        drains it, so publisher and consumer never need to be alive at the same
+        moment (a cloud finishes only after the server stopped consuming
+        rpc_queue). Utilization is telemetry — every failure path degrades to a
+        warning, never an exception that could kill the run."""
+        if stats is None:
+            return
+        message = {
+            "action": "UTILIZATION",
+            "client_id": self.client_id,
+            "layer_id": self.layer_id,
+        }
+        message.update(stats)
+        try:
+            self.channel.queue_declare(self.utilization_queue, durable=False)
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=self.utilization_queue,
+                body=pickle.dumps(message),
+            )
+        except Exception as e:
+            Log.print_with_color(f"[Utilization] send failed: {e}", "yellow")
+
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
         if mode != "only_cloud":
@@ -551,6 +637,11 @@ class Scheduler:
         """Broadcast this edge's metrics CSV to the cluster, tell the server this
         edge is done, then block until the server replies STOP. Shared by the
         sequential (first_layer) and threaded (_first_layer_mt) edge paths."""
+        # Whole-run utilization from this edge's own timing log — 'end' is already
+        # logged by both callers, and the report must go out BEFORE NOTIFY so it
+        # is on the broker when the server starts its shutdown sequence.
+        self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
+
         # Broadcast metrics CSV lên tất cả cloud trong cluster qua fanout exchange
         metrics_file = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
         if os.path.exists(metrics_file):
@@ -735,6 +826,9 @@ class Scheduler:
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        # Last step on this device: compute the whole-run ratio from the timing
+        # log and park the report on utilization_queue for the server to collect.
+        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -986,6 +1080,10 @@ class Scheduler:
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        # Last step on this device: compute the whole-run ratio from the timing
+        # log and park the report on utilization_queue for the server to collect.
+        # (Runs on the recv/main thread, which owns the pika channel.)
+        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
 
     def _cloud_recv_worker(self, local_q, splits, compress):
         try:

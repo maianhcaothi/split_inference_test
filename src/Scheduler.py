@@ -80,9 +80,6 @@ class Scheduler:
         self.backpressure_max = MAX_QUEUE_ONLY_CLOUD
 
         self.map_metric = None
-        # Separate metric instance, reset every batch, so a per-batch mAP can be
-        # read without disturbing the whole-run self.map_metric accumulation.
-        self.map_metric_batch = None
         self.gt_dict = {}
         # Detections are streamed to detections_stream.jsonl during the run (flat
         # RAM); detections.json is rebuilt from that file at the end. Keep only a
@@ -90,16 +87,15 @@ class Scheduler:
         self.save_detections_json = True
         self._det_count = 0
         self._map_updated = False
-        # One mAP@50:95 value per batch that had >=1 GT-matched frame. Averaged
-        # into a single number and reported to the server (map_queue) when this
-        # device's pipeline finishes — see _send_map_report.
-        self._batch_map_values = []
-        # 'map_queue': whichever tier runs postprocess_yolo (last_layer/only_edge)
-        # publishes its whole-run mean batch-mAP here when done, mirroring the
-        # utilization_queue pattern. The server combines per-cluster reports
-        # (average) into map.log during its shutdown collection step.
-        self.map_queue = "map_queue"
-        self.channel.queue_declare(self.map_queue, durable=False)
+        # 'map_pred_queue': whichever tier runs postprocess_yolo (last_layer/
+        # only_edge) zips up its own map/pred/*.txt files and publishes them here,
+        # tagged with its cluster id (self.intermediate_queue), when its pipeline
+        # finishes. The server unpacks them per cluster, matches against its own
+        # local map/label/ ground truth, and computes a sliding-window mAP into
+        # map.log during its shutdown collection step — see _send_pred_dir_to_server
+        # and Server._collect_map_pred.
+        self.map_pred_queue = "map_pred_queue"
+        self.channel.queue_declare(self.map_pred_queue, durable=False)
         self._load_gt_dict()
 
     def get_ram_mb(self):
@@ -213,8 +209,6 @@ class Scheduler:
             from torchmetrics.detection import MeanAveragePrecision
             self.map_metric = MeanAveragePrecision(iou_type="bbox")
             self.map_metric.warn_on_many_detections = False
-            self.map_metric_batch = MeanAveragePrecision(iou_type="bbox")
-            self.map_metric_batch.warn_on_many_detections = False
         except ImportError:
             Log.print_with_color("[!] torchmetrics not installed, mAP disabled", "red")
             return
@@ -247,9 +241,6 @@ class Scheduler:
         # map_results uses conf≈0.001 so torchmetrics gets the full PR curve;
         # batch_results (conf=0.25) is only for the detection stream / display.
         _map = map_results if map_results is not None else batch_results
-        if self.map_metric_batch is not None:
-            self.map_metric_batch.reset()
-        batch_has_gt = False
         for img_idx, (r, rm) in enumerate(zip(batch_results, _map)):
             frame_num = batch_id * batch_size + img_idx + 1
             dets = [
@@ -268,41 +259,37 @@ class Scheduler:
             self._write_pred_file(frame_num, rm)
             if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
-            preds = [{"boxes":  rm["boxes"].cpu().float(),
-                      "scores": rm["scores"].cpu().float(),
-                      "labels": rm["classes"].cpu().long()}]
-            gt = [self.gt_dict[frame_num]]
-            self.map_metric.update(preds, gt)
-            self.map_metric_batch.update(preds, gt)
-            batch_has_gt = True
-        if batch_has_gt:
-            self._record_batch_map(batch_id)
+            self.map_metric.update(
+                [{"boxes":  rm["boxes"].cpu().float(),
+                  "scores": rm["scores"].cpu().float(),
+                  "labels": rm["classes"].cpu().long()}],
+                [self.gt_dict[frame_num]]
+            )
 
-    def _record_batch_map(self, batch_id):
-        """Compute mAP@50:95 for THIS batch only (map_metric_batch was reset at the
-        top of _update_map, so its state covers just these frames), and fold it
-        into the running list that _send_map_report averages at pipeline finish.
-        Kept separate from self.map_metric, which accumulates over the whole run
-        for the final _print_map summary."""
-        try:
-            result = self.map_metric_batch.compute()
-            batch_map = float(result["map"])
-        except Exception as e:
-            Log.print_with_color(f"[mAP][batch={batch_id}] compute failed: {e}", "yellow")
-            return
-        if batch_map < 0:
-            return  # torchmetrics returns -1 when there are no valid preds/targets
-        self._batch_map_values.append(batch_map)
-        Log.print_with_color(f"[mAP][batch={batch_id}] mAP@50:95={batch_map:.4f}", "cyan")
+    def _cluster_tag(self):
+        """Filesystem-safe cluster id derived from self.intermediate_queue (e.g.
+        'intermediate_queue_0' under Hungarian, or plain 'intermediate_queue'
+        otherwise), used to keep each cluster's predictions in their own
+        subdirectory even when multiple clouds share one machine/filesystem."""
+        return "".join(c if c.isalnum() or c in "_-" else "_" for c in self.intermediate_queue)
 
     def _write_pred_file(self, frame_num, rm):
         """Write this frame's low-threshold detections (conf~=0.001 sweep, same set
-        fed to torchmetrics) to map/pred/frame_NNNNNN.txt, mirroring the
+        fed to torchmetrics) to map/pred/<cluster>/frame_NNNNNN.txt, mirroring the
         'class_id x_center y_center width height' layout of map/label/ (normalized
         to the 640x640 network input, matching how _load_gt_dict decodes that
         folder) with confidence appended, so an external mAP tool can diff the two
-        folders frame-for-frame."""
-        os.makedirs("map/pred", exist_ok=True)
+        folders frame-for-frame. Scoped under the cluster's own subdirectory so
+        multiple clouds sharing one filesystem never mix predictions.
+        Write-once: if this frame index already has a file (e.g. a second edge in
+        the same cluster reprocessing the same video, or a stale batch_id from a
+        previous run), skip it instead of overwriting — one frame index keeps
+        exactly one prediction file, same as map/label/."""
+        cluster_dir = f"map/pred/{self._cluster_tag()}"
+        path = f"{cluster_dir}/frame_{frame_num:06d}.txt"
+        if os.path.exists(path):
+            return
+        os.makedirs(cluster_dir, exist_ok=True)
         boxes = rm["boxes"].cpu()
         scores = rm["scores"].cpu()
         classes = rm["classes"].cpu()
@@ -314,7 +301,7 @@ class Scheduler:
             w = (x2 - x1) / 640
             h = (y2 - y1) / 640
             lines.append(f"{int(classes[i])} {cx} {cy} {w} {h} {float(scores[i]):.4f}")
-        with open(f"map/pred/frame_{frame_num:06d}.txt", "w") as f:
+        with open(path, "w") as f:
             f.write("\n".join(lines))
             if lines:
                 f.write("\n")
@@ -479,37 +466,44 @@ class Scheduler:
         except Exception as e:
             Log.print_with_color(f"[Utilization] send failed: {e}", "yellow")
 
-    def _send_map_report(self):
-        """Publish this device's whole-run mAP (mean of its per-batch mAP values,
-        see _record_batch_map) to map_queue once the pipeline finishes. Only
-        called by the tier that actually ran postprocess_yolo (guarded by
-        self._map_updated at the call site) — mirrors _send_utilization's
-        report-then-let-the-server-collect-at-shutdown pattern. queue_name lets
-        the server group reports by cluster (Hungarian assigns one
-        intermediate_queue_k per cluster)."""
-        if not self._batch_map_values:
+    def _send_pred_dir_to_server(self):
+        """Zip this device's own map/pred/<cluster>/*.txt files and publish them
+        to map_pred_queue, tagged with the cluster id (self.intermediate_queue),
+        once the pipeline finishes. Only called by the tier that actually ran
+        postprocess_yolo (guarded by self._map_updated at the call site) —
+        mirrors _send_utilization's report-then-let-the-server-collect-at-
+        shutdown pattern. The server unpacks these per cluster, matches them
+        against its own local map/label/ ground truth, and computes a
+        sliding-window mAP (see Server._collect_map_pred)."""
+        import glob as _glob
+        import zipfile
+        import io
+        files = sorted(_glob.glob(f"map/pred/{self._cluster_tag()}/frame_*.txt"))
+        if not files:
             return
-        mean_map = sum(self._batch_map_values) / len(self._batch_map_values)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fpath in files:
+                zf.write(fpath, arcname=os.path.basename(fpath))
         message = {
-            "action": "MAP",
+            "action": "MAP_PRED",
             "client_id": self.client_id,
             "layer_id": self.layer_id,
-            "queue_name": self.intermediate_queue,
-            "mean_map": mean_map,
-            "num_batches": len(self._batch_map_values),
+            "cluster_id": self.intermediate_queue,
+            "zip_bytes": buf.getvalue(),
         }
         try:
-            self.channel.queue_declare(self.map_queue, durable=False)
+            self.channel.queue_declare(self.map_pred_queue, durable=False)
             self.channel.basic_publish(
                 exchange='',
-                routing_key=self.map_queue,
+                routing_key=self.map_pred_queue,
                 body=pickle.dumps(message),
             )
             Log.print_with_color(
-                f"[mAP] Sent whole-run mAP={mean_map:.4f} "
-                f"(avg of {len(self._batch_map_values)} batch(es)) to server", "cyan")
+                f"[mAP] Sent {len(files)} pred file(s) for cluster "
+                f"'{self.intermediate_queue}' to server", "cyan")
         except Exception as e:
-            Log.print_with_color(f"[mAP] send failed: {e}", "yellow")
+            Log.print_with_color(f"[mAP] send pred dir failed: {e}", "yellow")
 
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
@@ -741,7 +735,7 @@ class Scheduler:
         # only_edge: this device ran postprocess_yolo itself (_map_updated flags
         # that _update_map ran), so it — not a cloud — owns the mAP report.
         if self._map_updated:
-            self._send_map_report()
+            self._send_pred_dir_to_server()
 
         # Broadcast metrics CSV lên tất cả cloud trong cluster qua fanout exchange
         metrics_file = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -935,7 +929,7 @@ class Scheduler:
         # log and park the report on utilization_queue for the server to collect.
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         if self._map_updated:
-            self._send_map_report()
+            self._send_pred_dir_to_server()
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -1204,7 +1198,7 @@ class Scheduler:
         # (Runs on the recv/main thread, which owns the pika channel.)
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         if self._map_updated:
-            self._send_map_report()
+            self._send_pred_dir_to_server()
 
     def _cloud_recv_worker(self, local_q, splits, compress):
         try:

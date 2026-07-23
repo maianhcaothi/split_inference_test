@@ -38,6 +38,17 @@ class Server:
                 except PermissionError:
                     src.Log.print_with_color(f"[!] Cannot delete {f} (file is open). Close it and retry.", "red")
 
+        # map/pred is write-once per frame index (Scheduler._write_pred_file skips
+        # a frame that already has a file), so leftovers from a previous run would
+        # otherwise "win" forever and silently poison every future run's mAP.
+        # map/pred_collected is this server's own scratch space, rebuilt every
+        # shutdown collection (_collect_map_pred) — stale content there is
+        # harmless but cleared anyway for a consistent fresh start.
+        for d in ("map/pred", "map/pred_collected"):
+            if os.path.isdir(d):
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+
         self.config = config
         self.address = config["rabbit"]["address"]
         self.username = config["rabbit"]["username"]
@@ -97,12 +108,14 @@ class Server:
         self.channel.queue_declare(queue='utilization_queue', durable=False)
         self.channel.queue_purge(queue='utilization_queue')
 
-        # mAP reports: whichever tier runs postprocess_yolo (last_layer/only_edge)
-        # computes a mean batch-mAP over its own run and publishes it to
-        # 'map_queue' when it finishes. Collected the same way as utilization,
-        # then combined per cluster (average) into map.log — see _collect_map.
-        self.channel.queue_declare(queue='map_queue', durable=False)
-        self.channel.queue_purge(queue='map_queue')
+        # mAP pred files: whichever tier runs postprocess_yolo (last_layer/
+        # only_edge) zips up its own map/pred/*.txt files and publishes them to
+        # 'map_pred_queue' (tagged with its cluster id) when it finishes. The
+        # server unpacks them per cluster at shutdown, matches against its own
+        # local map/label/ ground truth, and computes a sliding-window mAP into
+        # map.log — see _collect_map_pred.
+        self.channel.queue_declare(queue='map_pred_queue', durable=False)
+        self.channel.queue_purge(queue='map_pred_queue')
         self._fps_times = []       # arrival time of every DONE (one per batch)
         self._fps_start_t = None   # when START was broadcast (system-fps t0)
         self._fps_printed = False
@@ -148,8 +161,8 @@ class Server:
         # _collect_utilization at shutdown. Truncated here so runs never mix.
         self.util_log_path = f"{log_path}/utilization.log"
         open(self.util_log_path, "w").close()
-        # One line per cluster (queue_name) + one OVERALL line, appended by
-        # _collect_map at shutdown. Truncated here so runs never mix.
+        # One line per cluster (cluster_id) + one OVERALL line, appended by
+        # _collect_map_pred at shutdown. Truncated here so runs never mix.
         self.map_log_path = f"{log_path}/map.log"
         open(self.map_log_path, "w").close()
         # One line per adaptive cut change:
@@ -396,14 +409,132 @@ class Server:
             src.Log.print_with_color(
                 f"[Utilization] Collected {len(reported)}/{expected} reports before timeout", "yellow")
 
-    def _collect_map(self, timeout_s=30.0):
-        """Shutdown step: drain every device's MAP report from map_queue, group by
-        cluster (queue_name — Hungarian assigns one intermediate_queue_k per
-        cluster, non-clustered runs just use 'intermediate_queue'), average within
-        each cluster, then average the cluster means into one OVERALL number.
-        Appends everything to map.log. Only the tier that ran postprocess_yolo
-        ever publishes here (only_edge edges, or the cloud in split/only_cloud),
-        so 'expected' is scoped to that tier rather than every registered client."""
+    def _load_map_label_gt(self, gt_dir="map/label"):
+        """Ground truth for server-side mAP: this server's own local copy of
+        map/label/frame_NNNNNN.txt, 'class_id cx cy w h' normalized to the
+        640x640 network input — same layout/convention as
+        Scheduler._load_gt_dict, just read from map/label instead of
+        datasets/groundtruth."""
+        import torch
+        gt_dict = {}
+        if not os.path.isdir(gt_dir):
+            return gt_dict
+        for fname in sorted(os.listdir(gt_dir)):
+            if not fname.endswith(".txt"):
+                continue
+            try:
+                num = int(os.path.splitext(fname)[0].split("_")[-1])
+            except ValueError:
+                continue
+            boxes, labels = [], []
+            with open(os.path.join(gt_dir, fname)) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    cls, cx, cy, bw, bh = map(float, parts[:5])
+                    boxes.append([(cx - bw / 2) * 640, (cy - bh / 2) * 640,
+                                  (cx + bw / 2) * 640, (cy + bh / 2) * 640])
+                    labels.append(int(cls))
+            gt_dict[num] = {
+                "boxes":  torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4)),
+                "labels": torch.tensor(labels, dtype=torch.int64)   if labels else torch.zeros(0, dtype=torch.int64),
+            }
+        return gt_dict
+
+    def _load_cluster_preds(self, pred_dir):
+        """Parse one cluster's collected map/pred/frame_NNNNNN.txt files (written
+        by Scheduler._write_pred_file: 'class_id cx cy w h confidence', 640-
+        normalized) into {frame_num: {boxes, scores, labels}} tensors."""
+        import torch
+        preds = {}
+        for fname in sorted(os.listdir(pred_dir)):
+            if not fname.endswith(".txt"):
+                continue
+            try:
+                num = int(os.path.splitext(fname)[0].split("_")[-1])
+            except ValueError:
+                continue
+            boxes, scores, labels = [], [], []
+            with open(os.path.join(pred_dir, fname)) as f:
+                for line in f:
+                    vals = line.strip().split()
+                    if len(vals) < 6:
+                        continue
+                    cls = int(vals[0])
+                    cx, cy, bw, bh, conf = map(float, vals[1:6])
+                    boxes.append([(cx - bw / 2) * 640, (cy - bh / 2) * 640,
+                                  (cx + bw / 2) * 640, (cy + bh / 2) * 640])
+                    scores.append(conf)
+                    labels.append(cls)
+            preds[num] = {
+                "boxes":  torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4)),
+                "scores": torch.tensor(scores, dtype=torch.float32) if scores else torch.zeros(0),
+                "labels": torch.tensor(labels, dtype=torch.int64)   if labels else torch.zeros(0, dtype=torch.int64),
+            }
+        return preds
+
+    def _windowed_cluster_map(self, gt_dict, pred_dict, batch_size, window_batches=16):
+        """mAP@50:95 for one cluster, using the same sliding-window idea as the
+        live window_fps rate (on_fps): group frames into batches of batch_size
+        (recovered from frame_num), then slide a window of `window_batches`
+        consecutive PRESENT batches one step at a time, compute mAP over each
+        window, and average the per-window values. If fewer batches exist than
+        the window size, one window covering everything is used instead."""
+        try:
+            from torchmetrics.detection import MeanAveragePrecision
+        except ImportError:
+            src.Log.print_with_color("[mAP] torchmetrics not installed on server, mAP disabled", "red")
+            return None
+
+        frames_by_batch = {}
+        for frame_num in pred_dict:
+            if frame_num not in gt_dict:
+                continue
+            b = (frame_num - 1) // batch_size
+            frames_by_batch.setdefault(b, []).append(frame_num)
+        if not frames_by_batch:
+            return None
+
+        batch_ids = sorted(frames_by_batch.keys())
+        W = min(window_batches, len(batch_ids))
+        window_values = []
+        for start in range(0, len(batch_ids) - W + 1):
+            metric = MeanAveragePrecision(iou_type="bbox")
+            metric.warn_on_many_detections = False
+            for b in batch_ids[start:start + W]:
+                for frame_num in frames_by_batch[b]:
+                    metric.update(
+                        [{"boxes":  pred_dict[frame_num]["boxes"],
+                          "scores": pred_dict[frame_num]["scores"],
+                          "labels": pred_dict[frame_num]["labels"]}],
+                        [gt_dict[frame_num]]
+                    )
+            try:
+                val = float(metric.compute()["map"])
+            except Exception:
+                continue
+            if val >= 0:
+                window_values.append(val)
+        if not window_values:
+            return None
+        return sum(window_values) / len(window_values)
+
+    def _collect_map_pred(self, timeout_s=30.0, window_batches=16):
+        """Shutdown step: drain every cloud's zipped map/pred/ directory from
+        map_pred_queue (tagged with cluster_id), unpack into a per-cluster folder
+        under map/pred_collected/ (write-once — a frame index already unpacked
+        for a cluster is kept, never overwritten, so a second edge in the same
+        cluster reprocessing the same video can't clobber it), match against this
+        server's own local map/label/ ground truth, and compute a sliding-window
+        mAP (window = `window_batches` consecutive batches) per cluster. Appends
+        one line per cluster plus an OVERALL line to map.log. Only the tier that
+        ran postprocess_yolo ever publishes here (only_edge edges, or the cloud in
+        split/only_cloud), so 'expected' is scoped to that tier."""
+        import zipfile
+        import io
+        import shutil
+
         mode = self._get_mode()
         if mode == "only_edge":
             expected = sum(1 for _, lid in self.list_clients if lid == 1)
@@ -412,11 +543,15 @@ class Server:
         if expected == 0:
             return
 
+        collect_root = "map/pred_collected"
+        if os.path.isdir(collect_root):
+            shutil.rmtree(collect_root, ignore_errors=True)
+
         reported = set()
-        per_cluster = {}   # queue_name -> [mean_map, ...]
+        cluster_dirs = {}   # cluster_id -> directory path
         deadline = time.time() + timeout_s
         while len(reported) < expected and time.time() < deadline:
-            method_frame, _, body = self.channel.basic_get(queue='map_queue', auto_ack=True)
+            method_frame, _, body = self.channel.basic_get(queue='map_pred_queue', auto_ack=True)
             if not method_frame:
                 time.sleep(0.2)
                 continue
@@ -424,30 +559,56 @@ class Server:
                 msg = pickle.loads(body)
             except Exception:
                 continue
-            if not isinstance(msg, dict) or msg.get("action") != "MAP":
+            if not isinstance(msg, dict) or msg.get("action") != "MAP_PRED":
                 continue
             reported.add(str(msg.get("client_id")))
-            queue_name = msg.get("queue_name", "intermediate_queue")
-            per_cluster.setdefault(queue_name, []).append(float(msg.get("mean_map", 0.0)))
+            cluster_id = str(msg.get("cluster_id", "intermediate_queue"))
+            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in cluster_id)
+            cluster_dir = os.path.join(collect_root, safe_name)
+            os.makedirs(cluster_dir, exist_ok=True)
+            cluster_dirs[cluster_id] = cluster_dir
+            try:
+                with zipfile.ZipFile(io.BytesIO(msg["zip_bytes"])) as zf:
+                    for name in zf.namelist():
+                        dest = os.path.join(cluster_dir, name)
+                        if os.path.exists(dest):
+                            continue
+                        with open(dest, "wb") as out:
+                            out.write(zf.read(name))
+                src.Log.print_with_color(
+                    f"[mAP] Received pred files for cluster '{cluster_id}' "
+                    f"from client {msg.get('client_id')}", "cyan")
+            except Exception as e:
+                src.Log.print_with_color(f"[mAP] Failed to unpack pred zip: {e}", "yellow")
         if len(reported) < expected:
             src.Log.print_with_color(
-                f"[mAP] Collected {len(reported)}/{expected} reports before timeout", "yellow")
-        if not per_cluster:
+                f"[mAP] Collected {len(reported)}/{expected} pred report(s) before timeout", "yellow")
+        if not cluster_dirs:
+            return
+
+        gt_dict = self._load_map_label_gt()
+        if not gt_dict:
+            src.Log.print_with_color("[mAP] Skipped: no ground truth found in map/label/ on this server", "yellow")
             return
 
         t_ns = time.time_ns()
         cluster_means = []
         with open(self.map_log_path, "a") as f:
-            for queue_name, values in sorted(per_cluster.items()):
-                cluster_mean = sum(values) / len(values)
-                cluster_means.append(cluster_mean)
-                line = f"{t_ns} cluster={queue_name} mAP={cluster_mean:.4f} (from {len(values)} device(s))"
+            for cluster_id, cluster_dir in sorted(cluster_dirs.items()):
+                pred_dict = self._load_cluster_preds(cluster_dir)
+                cluster_map = self._windowed_cluster_map(gt_dict, pred_dict, self.batch_size, window_batches)
+                if cluster_map is None:
+                    continue
+                cluster_means.append(cluster_map)
+                line = (f"{t_ns} cluster={cluster_id} mAP={cluster_map:.4f} "
+                        f"(sliding window={window_batches} batches, {len(pred_dict)} frame(s))")
                 f.write(line + "\n")
                 src.Log.print_with_color(f"[mAP] {line}", "cyan")
-            overall = sum(cluster_means) / len(cluster_means)
-            line = f"{t_ns} OVERALL mAP={overall:.4f} (avg over {len(cluster_means)} cluster(s))"
-            f.write(line + "\n")
-            src.Log.print_with_color(f"[mAP] {line}", "cyan")
+            if cluster_means:
+                overall = sum(cluster_means) / len(cluster_means)
+                line = f"{t_ns} OVERALL mAP={overall:.4f} (avg over {len(cluster_means)} cluster(s))"
+                f.write(line + "\n")
+                src.Log.print_with_color(f"[mAP] {line}", "cyan")
 
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"
@@ -461,7 +622,7 @@ class Server:
         # drain + summary done) — now gather every device's utilization report
         # before closing the connection.
         self._collect_utilization()
-        self._collect_map()
+        self._collect_map_pred()
         self.connection.close()
         sys.exit(0)
 

@@ -96,6 +96,13 @@ class Server:
         # discards stale reports from a crashed run.
         self.channel.queue_declare(queue='utilization_queue', durable=False)
         self.channel.queue_purge(queue='utilization_queue')
+
+        # mAP reports: whichever tier runs postprocess_yolo (last_layer/only_edge)
+        # computes a mean batch-mAP over its own run and publishes it to
+        # 'map_queue' when it finishes. Collected the same way as utilization,
+        # then combined per cluster (average) into map.log — see _collect_map.
+        self.channel.queue_declare(queue='map_queue', durable=False)
+        self.channel.queue_purge(queue='map_queue')
         self._fps_times = []       # arrival time of every DONE (one per batch)
         self._fps_start_t = None   # when START was broadcast (system-fps t0)
         self._fps_printed = False
@@ -141,6 +148,10 @@ class Server:
         # _collect_utilization at shutdown. Truncated here so runs never mix.
         self.util_log_path = f"{log_path}/utilization.log"
         open(self.util_log_path, "w").close()
+        # One line per cluster (queue_name) + one OVERALL line, appended by
+        # _collect_map at shutdown. Truncated here so runs never mix.
+        self.map_log_path = f"{log_path}/map.log"
+        open(self.map_log_path, "w").close()
         # One line per adaptive cut change:
         # "<ns-epoch> <queue>: cut <old>-><new> <deeper|shallower>".
         # Truncated only when the adaptive controller is enabled, so a
@@ -385,6 +396,59 @@ class Server:
             src.Log.print_with_color(
                 f"[Utilization] Collected {len(reported)}/{expected} reports before timeout", "yellow")
 
+    def _collect_map(self, timeout_s=30.0):
+        """Shutdown step: drain every device's MAP report from map_queue, group by
+        cluster (queue_name — Hungarian assigns one intermediate_queue_k per
+        cluster, non-clustered runs just use 'intermediate_queue'), average within
+        each cluster, then average the cluster means into one OVERALL number.
+        Appends everything to map.log. Only the tier that ran postprocess_yolo
+        ever publishes here (only_edge edges, or the cloud in split/only_cloud),
+        so 'expected' is scoped to that tier rather than every registered client."""
+        mode = self._get_mode()
+        if mode == "only_edge":
+            expected = sum(1 for _, lid in self.list_clients if lid == 1)
+        else:
+            expected = sum(1 for _, lid in self.list_clients if lid == len(self.total_clients))
+        if expected == 0:
+            return
+
+        reported = set()
+        per_cluster = {}   # queue_name -> [mean_map, ...]
+        deadline = time.time() + timeout_s
+        while len(reported) < expected and time.time() < deadline:
+            method_frame, _, body = self.channel.basic_get(queue='map_queue', auto_ack=True)
+            if not method_frame:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if not isinstance(msg, dict) or msg.get("action") != "MAP":
+                continue
+            reported.add(str(msg.get("client_id")))
+            queue_name = msg.get("queue_name", "intermediate_queue")
+            per_cluster.setdefault(queue_name, []).append(float(msg.get("mean_map", 0.0)))
+        if len(reported) < expected:
+            src.Log.print_with_color(
+                f"[mAP] Collected {len(reported)}/{expected} reports before timeout", "yellow")
+        if not per_cluster:
+            return
+
+        t_ns = time.time_ns()
+        cluster_means = []
+        with open(self.map_log_path, "a") as f:
+            for queue_name, values in sorted(per_cluster.items()):
+                cluster_mean = sum(values) / len(values)
+                cluster_means.append(cluster_mean)
+                line = f"{t_ns} cluster={queue_name} mAP={cluster_mean:.4f} (from {len(values)} device(s))"
+                f.write(line + "\n")
+                src.Log.print_with_color(f"[mAP] {line}", "cyan")
+            overall = sum(cluster_means) / len(cluster_means)
+            line = f"{t_ns} OVERALL mAP={overall:.4f} (avg over {len(cluster_means)} cluster(s))"
+            f.write(line + "\n")
+            src.Log.print_with_color(f"[mAP] {line}", "cyan")
+
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"
         self.reply_channel.queue_declare(reply_queue_name, durable=False)
@@ -397,6 +461,7 @@ class Server:
         # drain + summary done) — now gather every device's utilization report
         # before closing the connection.
         self._collect_utilization()
+        self._collect_map()
         self.connection.close()
         sys.exit(0)
 

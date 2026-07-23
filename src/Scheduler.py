@@ -80,6 +80,9 @@ class Scheduler:
         self.backpressure_max = MAX_QUEUE_ONLY_CLOUD
 
         self.map_metric = None
+        # Separate metric instance, reset every batch, so a per-batch mAP can be
+        # read without disturbing the whole-run self.map_metric accumulation.
+        self.map_metric_batch = None
         self.gt_dict = {}
         # Detections are streamed to detections_stream.jsonl during the run (flat
         # RAM); detections.json is rebuilt from that file at the end. Keep only a
@@ -87,6 +90,16 @@ class Scheduler:
         self.save_detections_json = True
         self._det_count = 0
         self._map_updated = False
+        # One mAP@50:95 value per batch that had >=1 GT-matched frame. Averaged
+        # into a single number and reported to the server (map_queue) when this
+        # device's pipeline finishes — see _send_map_report.
+        self._batch_map_values = []
+        # 'map_queue': whichever tier runs postprocess_yolo (last_layer/only_edge)
+        # publishes its whole-run mean batch-mAP here when done, mirroring the
+        # utilization_queue pattern. The server combines per-cluster reports
+        # (average) into map.log during its shutdown collection step.
+        self.map_queue = "map_queue"
+        self.channel.queue_declare(self.map_queue, durable=False)
         self._load_gt_dict()
 
     def get_ram_mb(self):
@@ -200,6 +213,8 @@ class Scheduler:
             from torchmetrics.detection import MeanAveragePrecision
             self.map_metric = MeanAveragePrecision(iou_type="bbox")
             self.map_metric.warn_on_many_detections = False
+            self.map_metric_batch = MeanAveragePrecision(iou_type="bbox")
+            self.map_metric_batch.warn_on_many_detections = False
         except ImportError:
             Log.print_with_color("[!] torchmetrics not installed, mAP disabled", "red")
             return
@@ -232,6 +247,9 @@ class Scheduler:
         # map_results uses conf≈0.001 so torchmetrics gets the full PR curve;
         # batch_results (conf=0.25) is only for the detection stream / display.
         _map = map_results if map_results is not None else batch_results
+        if self.map_metric_batch is not None:
+            self.map_metric_batch.reset()
+        batch_has_gt = False
         for img_idx, (r, rm) in enumerate(zip(batch_results, _map)):
             frame_num = batch_id * batch_size + img_idx + 1
             dets = [
@@ -247,14 +265,59 @@ class Scheduler:
             self._det_count += 1
             with open("detections_stream.jsonl", "a") as f:
                 f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
+            self._write_pred_file(frame_num, rm)
             if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
-            self.map_metric.update(
-                [{"boxes":  rm["boxes"].cpu().float(),
-                  "scores": rm["scores"].cpu().float(),
-                  "labels": rm["classes"].cpu().long()}],
-                [self.gt_dict[frame_num]]
-            )
+            preds = [{"boxes":  rm["boxes"].cpu().float(),
+                      "scores": rm["scores"].cpu().float(),
+                      "labels": rm["classes"].cpu().long()}]
+            gt = [self.gt_dict[frame_num]]
+            self.map_metric.update(preds, gt)
+            self.map_metric_batch.update(preds, gt)
+            batch_has_gt = True
+        if batch_has_gt:
+            self._record_batch_map(batch_id)
+
+    def _record_batch_map(self, batch_id):
+        """Compute mAP@50:95 for THIS batch only (map_metric_batch was reset at the
+        top of _update_map, so its state covers just these frames), and fold it
+        into the running list that _send_map_report averages at pipeline finish.
+        Kept separate from self.map_metric, which accumulates over the whole run
+        for the final _print_map summary."""
+        try:
+            result = self.map_metric_batch.compute()
+            batch_map = float(result["map"])
+        except Exception as e:
+            Log.print_with_color(f"[mAP][batch={batch_id}] compute failed: {e}", "yellow")
+            return
+        if batch_map < 0:
+            return  # torchmetrics returns -1 when there are no valid preds/targets
+        self._batch_map_values.append(batch_map)
+        Log.print_with_color(f"[mAP][batch={batch_id}] mAP@50:95={batch_map:.4f}", "cyan")
+
+    def _write_pred_file(self, frame_num, rm):
+        """Write this frame's low-threshold detections (conf~=0.001 sweep, same set
+        fed to torchmetrics) to map/pred/frame_NNNNNN.txt, mirroring the
+        'class_id x_center y_center width height' layout of map/label/ (normalized
+        to the 640x640 network input, matching how _load_gt_dict decodes that
+        folder) with confidence appended, so an external mAP tool can diff the two
+        folders frame-for-frame."""
+        os.makedirs("map/pred", exist_ok=True)
+        boxes = rm["boxes"].cpu()
+        scores = rm["scores"].cpu()
+        classes = rm["classes"].cpu()
+        lines = []
+        for i in range(len(boxes)):
+            x1, y1, x2, y2 = boxes[i].tolist()
+            cx = (x1 + x2) / 2 / 640
+            cy = (y1 + y2) / 2 / 640
+            w = (x2 - x1) / 640
+            h = (y2 - y1) / 640
+            lines.append(f"{int(classes[i])} {cx} {cy} {w} {h} {float(scores[i]):.4f}")
+        with open(f"map/pred/frame_{frame_num:06d}.txt", "w") as f:
+            f.write("\n".join(lines))
+            if lines:
+                f.write("\n")
 
     def _print_map(self):
         if self.map_metric is None:
@@ -416,6 +479,38 @@ class Scheduler:
         except Exception as e:
             Log.print_with_color(f"[Utilization] send failed: {e}", "yellow")
 
+    def _send_map_report(self):
+        """Publish this device's whole-run mAP (mean of its per-batch mAP values,
+        see _record_batch_map) to map_queue once the pipeline finishes. Only
+        called by the tier that actually ran postprocess_yolo (guarded by
+        self._map_updated at the call site) — mirrors _send_utilization's
+        report-then-let-the-server-collect-at-shutdown pattern. queue_name lets
+        the server group reports by cluster (Hungarian assigns one
+        intermediate_queue_k per cluster)."""
+        if not self._batch_map_values:
+            return
+        mean_map = sum(self._batch_map_values) / len(self._batch_map_values)
+        message = {
+            "action": "MAP",
+            "client_id": self.client_id,
+            "layer_id": self.layer_id,
+            "queue_name": self.intermediate_queue,
+            "mean_map": mean_map,
+            "num_batches": len(self._batch_map_values),
+        }
+        try:
+            self.channel.queue_declare(self.map_queue, durable=False)
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=self.map_queue,
+                body=pickle.dumps(message),
+            )
+            Log.print_with_color(
+                f"[mAP] Sent whole-run mAP={mean_map:.4f} "
+                f"(avg of {len(self._batch_map_values)} batch(es)) to server", "cyan")
+        except Exception as e:
+            Log.print_with_color(f"[mAP] send failed: {e}", "yellow")
+
     def first_layer(self, model, data, batch_size, splits, logger, compress, mode="split", save_set=None):
         input_image = []
         if mode != "only_cloud":
@@ -489,7 +584,8 @@ class Scheduler:
                         "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
                         "width": width,
                         "height": height,
-                        "edge_start_time": edge_start_wall
+                        "edge_start_time": edge_start_wall,
+                        "batch_id": batch_id,
                     }
 
                     _wait_start = time.perf_counter()
@@ -561,7 +657,8 @@ class Scheduler:
                         "data": y,
                         "width": width,
                         "height": height,
-                        "edge_start_time": edge_start_wall
+                        "edge_start_time": edge_start_wall,
+                        "batch_id": batch_id,
                     }
                     if self.adaptive_on:
                         y["cut"] = int(cut)
@@ -641,6 +738,10 @@ class Scheduler:
         # logged by both callers, and the report must go out BEFORE NOTIFY so it
         # is on the broker when the server starts its shutdown sequence.
         self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
+        # only_edge: this device ran postprocess_yolo itself (_map_updated flags
+        # that _update_map ran), so it — not a cloud — owns the mAP report.
+        if self._map_updated:
+            self._send_map_report()
 
         # Broadcast metrics CSV lên tất cả cloud trong cluster qua fanout exchange
         metrics_file = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -700,6 +801,10 @@ class Scheduler:
                 received_data = pickle.loads(body)
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
+                # Prefer the edge's own batch_id (rides in the message) over this
+                # loop's local receive-order counter, so frame_num stays correct
+                # even if arrival order ever diverges from send order.
+                msg_batch_id = y.get("batch_id", batch_id)
                 cloud_best_cut = "N/A" if splits is None else splits  # overridden per-batch when adaptive
 
                 # ===== ONLY EDGE (cloud just receives lightweight results) =====
@@ -763,7 +868,7 @@ class Scheduler:
                     _post_start = time.perf_counter()
                     results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                     map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                    self._update_map(results, batch_id, batch_size, map_results=map_results)
+                    self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
                 batch_end = time.perf_counter()
@@ -829,6 +934,8 @@ class Scheduler:
         # Last step on this device: compute the whole-run ratio from the timing
         # log and park the report on utilization_queue for the server to collect.
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
+        if self._map_updated:
+            self._send_map_report()
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -991,6 +1098,8 @@ class Scheduler:
         if self.backpressure_on:
             self._check_backpressure(self.backpressure_max)
 
+        payload["batch_id"] = batch_id
+
         _send = time.perf_counter()
         self.send_next_layer(self.intermediate_queue, payload, compress)
         send_ms = (time.perf_counter() - _send) * 1000
@@ -1020,6 +1129,12 @@ class Scheduler:
                 item = self._mt_get(in_q)
                 if item is None:
                     break
+                # Utilization markers live on THIS thread: it is the only stage
+                # that handles batches strictly one-at-a-time, so its busy
+                # intervals never overlap (summing them stays valid). Idle =
+                # blocked in _mt_get above, i.e. waiting for an incoming batch.
+                with open(self._timing_log_edge, "a") as _tf:
+                    print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start, edge_start_wall, x_in = item
                 x_in = x_in.to(self.device)
 
@@ -1048,6 +1163,10 @@ class Scheduler:
                        "inference_ms": inference_ms, "cut": cut, "payload": payload}
                 if not self._mt_put(out_q, out):
                     break
+                # Blocking on a full out_q (slow network) counts as busy —
+                # occupancy, same as the sequential path's send/queue_wait time.
+                with open(self._timing_log_edge, "a") as _tf:
+                    print(str(time.time_ns()) + " output", file=_tf)
         except Exception as e:
             Log.print_with_color(f"[edge-mt][infer] {e!r}", "yellow")
             traceback.print_exc()
@@ -1084,6 +1203,8 @@ class Scheduler:
         # log and park the report on utilization_queue for the server to collect.
         # (Runs on the recv/main thread, which owns the pika channel.)
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
+        if self._map_updated:
+            self._send_map_report()
 
     def _cloud_recv_worker(self, local_q, splits, compress):
         try:
@@ -1140,9 +1261,19 @@ class Scheduler:
                 item = self._mt_get(local_q)
                 if item is None:
                     break
+                # Utilization markers live on THIS thread: it is the only stage
+                # that handles batches strictly one-at-a-time, so its busy
+                # intervals never overlap (summing them stays valid). Idle =
+                # blocked in _mt_get above, i.e. waiting for an incoming batch.
+                with open(self._timing_log_cloud, "a") as _tf:
+                    print(str(time.time_ns()) + " get input", file=_tf)
                 received_message_size, y, edge_start_time, cut, decode_ms = item
 
                 t0 = time.perf_counter()
+                # Prefer the edge's own batch_id (rides in the message) over this
+                # loop's local receive-order counter, so frame_num stays correct
+                # even if arrival order ever diverges from send order.
+                msg_batch_id = y.get("batch_id", batch_id)
                 y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
                 list_output = y["data"]
                 x = list_output[-1]
@@ -1161,7 +1292,11 @@ class Scheduler:
 
                 results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
                 map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                self._update_map(results, batch_id, batch_size, map_results=map_results)
+                self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
+                # Same point as the sequential path: right after postprocess,
+                # before the metrics bookkeeping.
+                with open(self._timing_log_cloud, "a") as _tf:
+                    print(str(time.time_ns()) + " output", file=_tf)
 
                 done = time.perf_counter()
                 cloud_end_wall = time.time()

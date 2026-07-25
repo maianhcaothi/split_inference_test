@@ -13,18 +13,15 @@ class Colors:
 
 
 class Logger:
-    def __init__(self, log_path, debug_mode=False):
+    def __init__(self, debug_mode=False):
         self.logger = logging.getLogger("my_logger")
         self.logger.setLevel(logging.DEBUG)
         self.debug_mode = debug_mode
-
-        file_handler = logging.FileHandler(log_path)
-        file_handler.setLevel(logging.DEBUG)
-
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-
-        self.logger.addHandler(file_handler)
+        # app.log file output disabled — console output via print_with_color
+        # already covers warnings/errors/debug. NullHandler just stops the
+        # stdlib's "no handlers found" fallback from writing to stderr.
+        if not self.logger.handlers:
+            self.logger.addHandler(logging.NullHandler())
 
     def log_info(self, message):
         self.logger.info(message)

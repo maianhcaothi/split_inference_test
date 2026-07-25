@@ -33,15 +33,12 @@ class Scheduler:
         self.channel = channel
         self.device = device
 
-        cid_short = str(client_id).replace('-', '')[:12]
-        self._timing_log_edge  = f"timing_edge_{cid_short}.log"
-        self._timing_log_cloud = f"timing_cloud_{cid_short}.log"
-        for tlog in [self._timing_log_edge, self._timing_log_cloud]:
-            if os.path.exists(tlog):
-                try:
-                    os.remove(tlog)
-                except Exception:
-                    pass
+        # In-memory (ns_timestamp, event) pairs — replaces the old
+        # timing_edge_*.log / timing_cloud_*.log files. Only this process
+        # needs them (to compute its own utilization ratio at finish), so
+        # nothing is written to disk.
+        self._timing_events_edge = []
+        self._timing_events_cloud = []
 
         self.size_message = None
         self.intermediate_queue = f"intermediate_queue"
@@ -81,6 +78,11 @@ class Scheduler:
 
         self.map_metric = None
         self.gt_dict = {}
+        # Highest frame index covered by local ground truth (e.g. 905 when the
+        # video has 1700 frames but only the first 905 are labelled). None until
+        # _load_gt_dict finds a groundtruth dir. Lets mAP work stop once the run
+        # moves past the labelled range instead of running on unlabelled frames.
+        self._max_gt_frame = None
         # Detections are streamed to detections_stream.jsonl during the run (flat
         # RAM); detections.json is rebuilt from that file at the end. Keep only a
         # count in RAM, not every frame's boxes.
@@ -127,6 +129,12 @@ class Scheduler:
             depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         Log.print_with_color(
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={max_queue}, resuming", "green")
+
+    def _mark_edge(self, event):
+        self._timing_events_edge.append((time.time_ns(), event))
+
+    def _mark_cloud(self, event):
+        self._timing_events_cloud.append((time.time_ns(), event))
 
     def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
@@ -233,7 +241,21 @@ class Scheduler:
                 "boxes":  torch.tensor(boxes,  dtype=torch.float32) if boxes  else torch.zeros((0, 4)),
                 "labels": torch.tensor(labels, dtype=torch.int64)   if labels else torch.zeros(0, dtype=torch.int64),
             }
-        Log.print_with_color(f"[mAP] Loaded GT for {len(self.gt_dict)} frames from '{gt_dir}'", "green")
+        if self.gt_dict:
+            self._max_gt_frame = max(self.gt_dict)
+        Log.print_with_color(
+            f"[mAP] Loaded GT for {len(self.gt_dict)} frames from '{gt_dir}'"
+            + (f" (up to frame {self._max_gt_frame})" if self._max_gt_frame else ""),
+            "green")
+
+    def _batch_past_gt(self, batch_id, batch_size):
+        """True once every frame in this batch is beyond the last frame index
+        covered by local ground truth — the video can run longer than the
+        labelled subset (e.g. 1700 frames but GT only for the first 905), so
+        mAP postprocessing for later batches would be pure waste."""
+        if self._max_gt_frame is None:
+            return False
+        return batch_id * batch_size + 1 > self._max_gt_frame
 
     def _update_map(self, batch_results, batch_id, batch_size, map_results=None):
         import json
@@ -256,6 +278,11 @@ class Scheduler:
             self._det_count += 1
             with open("detections_stream.jsonl", "a") as f:
                 f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
+            if self._max_gt_frame is not None and frame_num > self._max_gt_frame:
+                # Past the labelled range: detections keep streaming above (for
+                # detections.json/tracker), but mAP stops here — no pred file,
+                # no metric update.
+                continue
             self._write_pred_file(frame_num, rm)
             if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
@@ -387,45 +414,37 @@ class Scheduler:
                 break
             self._send_fps_done()
 
-    def _compute_utilization(self, log_path, role):
-        """Parse this device's timing log (one "<ns> <event>" line per lifecycle
-        event) into ONE whole-run utilization ratio:
+    def _compute_utilization(self, events, role):
+        """Fold this device's in-memory timing events (one (ns_timestamp, event)
+        pair per lifecycle event, recorded by _mark_edge/_mark_cloud) into ONE
+        whole-run utilization ratio:
             utilization = busy / total = sum(output_i - get_input_i) / (end - start)
         Numerator and denominator come from the same device's own clock, so clock
         skew between machines cannot distort the ratio. Unknown events (e.g.
-        queue_wait_start/queue_wait_end) are ignored, so the log format stays
+        queue_wait_start/queue_wait_end) are ignored, so the event set stays
         forward-extensible; an unmatched 'get input' with no following 'output'
-        (crash mid-batch) is dropped. Returns the stats dict, or None if the log
-        is missing or incomplete."""
+        (crash mid-batch) is dropped. Returns the stats dict, or None if the
+        events are incomplete."""
         t_start = None
         t_end = None
         t_input = None
         busy_ns = 0
         n_packages = 0
-        try:
-            with open(log_path) as f:
-                for line in f:
-                    parts = line.strip().split(" ", 1)  # event names contain spaces
-                    if len(parts) != 2 or not parts[0].isdigit():
-                        continue
-                    ts, event = int(parts[0]), parts[1]
-                    if event == "start":
-                        t_start = ts
-                    elif event == "end":
-                        t_end = ts
-                    elif event == "get input":
-                        t_input = ts
-                    elif event == "output":
-                        if t_input is not None:
-                            busy_ns += ts - t_input
-                            n_packages += 1
-                            t_input = None
-        except Exception as e:
-            Log.print_with_color(f"[Utilization] cannot read {log_path}: {e}", "yellow")
-            return None
+        for ts, event in events:
+            if event == "start":
+                t_start = ts
+            elif event == "end":
+                t_end = ts
+            elif event == "get input":
+                t_input = ts
+            elif event == "output":
+                if t_input is not None:
+                    busy_ns += ts - t_input
+                    n_packages += 1
+                    t_input = None
         if t_start is None or t_end is None or t_end <= t_start:
             Log.print_with_color(
-                f"[Utilization] incomplete timing log {log_path} (missing/invalid start-end)", "yellow")
+                f"[Utilization] incomplete timing events for {role} (missing/invalid start-end)", "yellow")
             return None
         total_ns = t_end - t_start
         stats = {
@@ -537,8 +556,7 @@ class Scheduler:
             Log.print_with_color(
                 f"[Adaptive][edge] enabled, L={self._L}, start cut={self.current_cut}", "cyan")
 
-        with open(self._timing_log_edge, "w") as _tf:
-            print(str(time.time_ns()) + " start", file=_tf)
+        self._mark_edge("start")
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -553,8 +571,7 @@ class Scheduler:
                     self._poll_ctrl()
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
-                with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                self._mark_edge("get input")
                 batch_start = time.perf_counter()
                 edge_start_wall = time.time()
 
@@ -583,11 +600,9 @@ class Scheduler:
                     }
 
                     _wait_start = time.perf_counter()
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_start", file=_tf)
+                    self._mark_edge("queue_wait_start")
                     self._check_backpressure(MAX_QUEUE_ONLY_CLOUD)
-                    with open(self._timing_log_edge, "a") as _tf:
-                        print(str(time.time_ns()) + " queue_wait_end", file=_tf)
+                    self._mark_edge("queue_wait_end")
                     queue_wait_ms = (time.perf_counter() - _wait_start) * 1000
 
                     _send_start = time.perf_counter()
@@ -607,8 +622,9 @@ class Scheduler:
                         x, y = inference(model, input_image, y, 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
-                    results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
-                    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                    results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
+                    map_results = None if self._batch_past_gt(batch_id, batch_size) else \
+                        postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                     _send_start = time.perf_counter()
@@ -669,8 +685,7 @@ class Scheduler:
                     )
                     send_ms = (time.perf_counter() - _send_start) * 1000
                 batch_end = time.perf_counter()
-                with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
+                self._mark_edge("output")
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = 0.0
@@ -716,8 +731,7 @@ class Scheduler:
                 pbar.update(batch_size)
             else:
                 continue
-        with open(self._timing_log_edge, "a") as _tf:
-            print(str(time.time_ns()) + " end", file=_tf)
+        self._mark_edge("end")
         print(f'size message: {self.size_message} bytes.')
         cap.release()
         pbar.close()
@@ -731,7 +745,7 @@ class Scheduler:
         # Whole-run utilization from this edge's own timing log — 'end' is already
         # logged by both callers, and the report must go out BEFORE NOTIFY so it
         # is on the broker when the server starts its shutdown sequence.
-        self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
+        self._send_utilization(self._compute_utilization(self._timing_events_edge, "edge"))
         # only_edge: this device ran postprocess_yolo itself (_map_updated flags
         # that _update_map ran), so it — not a cloud — owns the mAP report.
         if self._map_updated:
@@ -781,15 +795,13 @@ class Scheduler:
         batch_id = 0
         prev_batch_end = None
         self.channel.queue_declare(self.fps_queue, durable=False)
-        with open(self._timing_log_cloud, "w") as _tf:
-            print(str(time.time_ns()) + " start", file=_tf)
+        self._mark_cloud("start")
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
             if method_frame and body:
                 t_batch_ready = time.perf_counter()
                 gap_ms = (t_batch_ready - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
-                with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                self._mark_cloud("get input")
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
@@ -860,14 +872,14 @@ class Scheduler:
                     postprocess_ms = 0.0
                 else:
                     _post_start = time.perf_counter()
-                    results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
-                    map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                    results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
+                    map_results = None if self._batch_past_gt(msg_batch_id, batch_size) else \
+                        postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                     self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
                 batch_end = time.perf_counter()
-                with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
+                self._mark_cloud("output")
                 cloud_end_wall = time.time()
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
@@ -923,11 +935,10 @@ class Scheduler:
                 else:
                     time.sleep(0.5)
 
-        with open(self._timing_log_cloud, "a") as _tf:
-            print(str(time.time_ns()) + " end", file=_tf)
+        self._mark_cloud("end")
         # Last step on this device: compute the whole-run ratio from the timing
-        # log and park the report on utilization_queue for the server to collect.
-        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
+        # events and park the report on utilization_queue for the server to collect.
+        self._send_utilization(self._compute_utilization(self._timing_events_cloud, "cloud"))
         if self._map_updated:
             self._send_pred_dir_to_server()
         try:
@@ -999,8 +1010,7 @@ class Scheduler:
         self._mt_stop = threading.Event()
         in_q = _queue.Queue(maxsize=self.mt_queue_size)
         out_q = _queue.Queue(maxsize=self.mt_queue_size)
-        with open(self._timing_log_edge, "w") as _tf:
-            print(str(time.time_ns()) + " start", file=_tf)
+        self._mark_edge("start")
 
         infer_t = threading.Thread(
             target=self._edge_infer_worker,
@@ -1011,8 +1021,7 @@ class Scheduler:
         self._edge_transfer_worker(cap, in_q, out_q, batch_size, compress, splits)
         infer_t.join()
 
-        with open(self._timing_log_edge, "a") as _tf:
-            print(str(time.time_ns()) + " end", file=_tf)
+        self._mark_edge("end")
         print(f'size message: {self.size_message} bytes.')
         cap.release()
         self._finish_edge()
@@ -1111,9 +1120,9 @@ class Scheduler:
             latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
             message_size_bytes=msg_size, e2e_latency_ms=0.0,
             edge_start_time=edge_start_wall)
-        Log.print_with_color(
-            f"[Timing][edge-mt] infer={inference_ms:.1f}ms send={send_ms:.1f}ms "
-            f"latency={latency_ms:.1f}ms cut={edge_best_cut}", "magenta")
+        # Log.print_with_color(
+        #     f"[Timing][edge-mt] infer={inference_ms:.1f}ms send={send_ms:.1f}ms "
+        #     f"latency={latency_ms:.1f}ms cut={edge_best_cut}", "magenta")
         pbar.update(batch_size)
 
     def _edge_infer_worker(self, model, in_q, out_q, width, height, splits, save_set):
@@ -1127,8 +1136,7 @@ class Scheduler:
                 # that handles batches strictly one-at-a-time, so its busy
                 # intervals never overlap (summing them stays valid). Idle =
                 # blocked in _mt_get above, i.e. waiting for an incoming batch.
-                with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                self._mark_edge("get input")
                 batch_start, edge_start_wall, x_in = item
                 x_in = x_in.to(self.device)
 
@@ -1159,8 +1167,7 @@ class Scheduler:
                     break
                 # Blocking on a full out_q (slow network) counts as busy —
                 # occupancy, same as the sequential path's send/queue_wait time.
-                with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
+                self._mark_edge("output")
         except Exception as e:
             Log.print_with_color(f"[edge-mt][infer] {e!r}", "yellow")
             traceback.print_exc()
@@ -1178,8 +1185,7 @@ class Scheduler:
         local_q = _queue.Queue(maxsize=self.mt_queue_size)
         self.channel.queue_declare(self.fps_queue, durable=False)
         self._fps_q = _queue.Queue()   # infer thread -> recv thread: fps 'done' pings
-        with open(self._timing_log_cloud, "w") as _tf:
-            print(str(time.time_ns()) + " start", file=_tf)
+        self._mark_cloud("start")
 
         infer_t = threading.Thread(
             target=self._cloud_infer_worker,
@@ -1191,12 +1197,11 @@ class Scheduler:
         infer_t.join()
         self._drain_fps_events()   # flush DONEs for the final in-flight batches
 
-        with open(self._timing_log_cloud, "a") as _tf:
-            print(str(time.time_ns()) + " end", file=_tf)
+        self._mark_cloud("end")
         # Last step on this device: compute the whole-run ratio from the timing
-        # log and park the report on utilization_queue for the server to collect.
+        # events and park the report on utilization_queue for the server to collect.
         # (Runs on the recv/main thread, which owns the pika channel.)
-        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
+        self._send_utilization(self._compute_utilization(self._timing_events_cloud, "cloud"))
         if self._map_updated:
             self._send_pred_dir_to_server()
 
@@ -1259,8 +1264,7 @@ class Scheduler:
                 # that handles batches strictly one-at-a-time, so its busy
                 # intervals never overlap (summing them stays valid). Idle =
                 # blocked in _mt_get above, i.e. waiting for an incoming batch.
-                with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                self._mark_cloud("get input")
                 received_message_size, y, edge_start_time, cut, decode_ms = item
 
                 t0 = time.perf_counter()
@@ -1284,13 +1288,13 @@ class Scheduler:
                 with torch.no_grad():
                     x, _ = inference(sub_model, x, list_output, use_cut, save_set)
 
-                results     = postprocess_yolo(x, conf_thres=0.25,  iou_thres=0.5)
-                map_results = postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
+                map_results = None if self._batch_past_gt(msg_batch_id, batch_size) else \
+                    postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
                 self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
                 # Same point as the sequential path: right after postprocess,
                 # before the metrics bookkeeping.
-                with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
+                self._mark_cloud("output")
 
                 done = time.perf_counter()
                 cloud_end_wall = time.time()
@@ -1305,9 +1309,9 @@ class Scheduler:
                     latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
                     message_size_bytes=received_message_size,
                     e2e_latency_ms=e2e_latency_ms, edge_start_time=edge_start_time)
-                Log.print_with_color(
-                    f"[Timing][cloud-mt] decode={decode_ms:.1f}ms infer+post={latency_ms:.1f}ms "
-                    f"e2e={e2e_latency_ms:.1f}ms cut={cloud_best_cut}", "magenta")
+                # Log.print_with_color(
+                #     f"[Timing][cloud-mt] decode={decode_ms:.1f}ms infer+post={latency_ms:.1f}ms "
+                #     f"e2e={e2e_latency_ms:.1f}ms cut={cloud_best_cut}", "magenta")
 
                 # Hand this batch's fps 'done' ping to the recv thread to publish
                 # (the recv thread owns the pika channel; this thread must not).

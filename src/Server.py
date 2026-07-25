@@ -150,7 +150,7 @@ class Server:
         self.compress = config["compress"]
 
         log_path = config["log-path"]
-        self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
+        self.logger = src.Log.Logger(config["debug-mode"])
         # One line per finished batch: ns-epoch arrival time of its DONE
         # (e.g. 1782962149610671139). Truncated here so a new run never
         # mixes timestamps with the previous one.

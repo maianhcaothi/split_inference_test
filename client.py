@@ -39,7 +39,7 @@ else:
     device = args.device
     print(f"Using device: {device}")
 
-logger = src.Log.Logger(f"./app.log" , config['debug-mode'])
+logger = src.Log.Logger(config['debug-mode'])
 logger.log_info(f"Application start.")
 
 credentials = pika.PlainCredentials(username, password)

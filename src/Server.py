@@ -66,6 +66,7 @@ class Server:
         self.multithreading_cfg = config.get("multithreading", {})
         self.backpressure_cfg = config.get("backpressure", {})
         self.detections_cfg = config.get("detections", {})
+        self.map_cfg = config.get("map", {})
         self.cluster_state = {}       # {queue_name: {"queue", "cut", "edges": [client_id,...]}}
         self._num_layers = None       # L, total model layers (for clamping the cut)
         self._adaptive_thread = None
@@ -112,8 +113,9 @@ class Server:
         # only_edge) zips up its own map/pred/*.txt files and publishes them to
         # 'map_pred_queue' (tagged with its cluster id) when it finishes. The
         # server unpacks them per cluster at shutdown, matches against its own
-        # local map/label/ ground truth, and computes a sliding-window mAP into
-        # map.log — see _collect_map_pred.
+        # local map/label/ ground truth, and runs TWO independent mAP pipelines
+        # over the result (sliding window + all frames) into map.log /
+        # map_window.log — see _collect_map_pred.
         self.channel.queue_declare(queue='map_pred_queue', durable=False)
         self.channel.queue_purge(queue='map_pred_queue')
         self._fps_times = []       # arrival time of every DONE (one per batch)
@@ -161,10 +163,16 @@ class Server:
         # _collect_utilization at shutdown. Truncated here so runs never mix.
         self.util_log_path = f"{log_path}/utilization.log"
         open(self.util_log_path, "w").close()
-        # One line per cluster (cluster_id) + one OVERALL line, appended by
-        # _collect_map_pred at shutdown. Truncated here so runs never mix.
+        # mAP summary: two lines per cluster (WINDOW = pipeline 1, ALL = pipeline 2)
+        # plus one OVERALL line per pipeline, appended by _collect_map_pred at
+        # shutdown. Truncated here so runs never mix.
         self.map_log_path = f"{log_path}/map.log"
         open(self.map_log_path, "w").close()
+        # mAP pipeline 1 detail: one line per sliding window (16 consecutive
+        # batches, stepped one batch at a time) — the plottable mAP-over-time
+        # series, mirroring how batch_done_ns.log carries the window_fps series.
+        self.map_window_log_path = f"{log_path}/map_window.log"
+        open(self.map_window_log_path, "w").close()
         # One line per adaptive cut change:
         # "<ns-epoch> <queue>: cut <old>-><new> <deeper|shallower>".
         # Truncated only when the adaptive controller is enabled, so a
@@ -474,66 +482,182 @@ class Server:
             }
         return preds
 
-    def _windowed_cluster_map(self, gt_dict, pred_dict, batch_size, window_batches=16):
-        """mAP@50:95 for one cluster, using the same sliding-window idea as the
-        live window_fps rate (on_fps): group frames into batches of batch_size
-        (recovered from frame_num), then slide a window of `window_batches`
-        consecutive PRESENT batches one step at a time, compute mAP over each
-        window, and average the per-window values. If fewer batches exist than
-        the window size, one window covering everything is used instead."""
+    def _map_for_frames(self, gt_dict, pred_dict, frames):
+        """mAP@50:95 and mAP@50 over exactly `frames` (frame numbers that exist in
+        BOTH pred_dict and gt_dict). Returns (map50_95, map50, n_frames), or None
+        if torchmetrics is missing / the compute failed.
+
+        Both pipelines below are just different framings of this one call, which is
+        why they are guaranteed comparable. torchmetrics takes parallel lists, so
+        this updates once with every frame instead of once per frame — with a
+        sliding window the same frame is scored in up to W windows, and per-frame
+        update() calls dominate the runtime."""
         try:
             from torchmetrics.detection import MeanAveragePrecision
         except ImportError:
             src.Log.print_with_color("[mAP] torchmetrics not installed on server, mAP disabled", "red")
             return None
+        preds, targets = [], []
+        for fn in frames:
+            preds.append({"boxes":  pred_dict[fn]["boxes"],
+                          "scores": pred_dict[fn]["scores"],
+                          "labels": pred_dict[fn]["labels"]})
+            targets.append(gt_dict[fn])
+        if not preds:
+            return None
+        metric = MeanAveragePrecision(iou_type="bbox")
+        metric.warn_on_many_detections = False
+        metric.update(preds, targets)
+        try:
+            res = metric.compute()
+        except Exception as e:
+            src.Log.print_with_color(f"[mAP] compute failed: {e}", "red")
+            return None
+        return float(res["map"]), float(res["map_50"]), len(preds)
 
+    def _frames_by_batch(self, gt_dict, pred_dict, batch_size):
+        """Group the scorable frames of one cluster back into the batches they were
+        processed in: frame_num = batch_id * batch_size + img_idx + 1 (see
+        Scheduler._update_map), so batch_id = (frame_num - 1) // batch_size.
+
+        Ground truth is the cap: a frame with no label file is dropped here, and
+        the workers already stop writing pred files past the last labelled frame
+        (Scheduler._batch_past_gt), so batches beyond the labelled range simply
+        never appear. Values are sorted so a window's frames stay in frame order."""
         frames_by_batch = {}
         for frame_num in pred_dict:
             if frame_num not in gt_dict:
                 continue
             b = (frame_num - 1) // batch_size
             frames_by_batch.setdefault(b, []).append(frame_num)
+        for b in frames_by_batch:
+            frames_by_batch[b].sort()
+        return frames_by_batch
+
+    def _map_pipeline_window(self, gt_dict, pred_dict, batch_size, cluster_id,
+                             t_ns, window_batches=16):
+        """PIPELINE 1 — sliding-window mAP, the accuracy counterpart of window_fps.
+
+        Slide a window of `window_batches` consecutive PRESENT batches one batch at
+        a time and compute a full mAP over each window's frames. Every window is
+        logged to map_window.log as its own line, giving an mAP-over-the-run series
+        that can be lined up against batch_done_ns.log / cut_change_ns.log to see
+        how accuracy responded to a split-point change. The returned mean over
+        windows is the single number for the summary.
+
+        Fewer batches than the window size → one window covering everything (so a
+        short run still reports something instead of nothing).
+
+        Returns (mean_map50_95, mean_map50, n_windows, W) or None."""
+        frames_by_batch = self._frames_by_batch(gt_dict, pred_dict, batch_size)
         if not frames_by_batch:
             return None
-
-        batch_ids = sorted(frames_by_batch.keys())
+        batch_ids = sorted(frames_by_batch)
         W = min(window_batches, len(batch_ids))
-        window_values = []
-        for start in range(0, len(batch_ids) - W + 1):
-            metric = MeanAveragePrecision(iou_type="bbox")
-            metric.warn_on_many_detections = False
-            for b in batch_ids[start:start + W]:
-                for frame_num in frames_by_batch[b]:
-                    metric.update(
-                        [{"boxes":  pred_dict[frame_num]["boxes"],
-                          "scores": pred_dict[frame_num]["scores"],
-                          "labels": pred_dict[frame_num]["labels"]}],
-                        [gt_dict[frame_num]]
-                    )
-            try:
-                val = float(metric.compute()["map"])
-            except Exception:
-                continue
-            if val >= 0:
-                window_values.append(val)
-        if not window_values:
+        vals, vals_50 = [], []
+        with open(self.map_window_log_path, "a") as f:
+            for i, start in enumerate(range(0, len(batch_ids) - W + 1)):
+                win = batch_ids[start:start + W]
+                frames = [fn for b in win for fn in frames_by_batch[b]]
+                r = self._map_for_frames(gt_dict, pred_dict, frames)
+                if r is None:
+                    continue
+                m, m50, n = r
+                if m < 0:      # torchmetrics returns -1 when a window has nothing to score
+                    continue
+                vals.append(m)
+                vals_50.append(m50)
+                line = (f"{t_ns} cluster={cluster_id} window={i} "
+                        f"batches={win[0]}-{win[-1]} frames={n} "
+                        f"mAP50_95={m:.4f} mAP50={m50:.4f}")
+                f.write(line + "\n")
+                src.Log.print_with_color(f"[mAP] {line}", "cyan")
+        if not vals:
             return None
-        return sum(window_values) / len(window_values)
+        return (sum(vals) / len(vals), sum(vals_50) / len(vals_50), len(vals), W)
 
-    def _collect_map_pred(self, timeout_s=30.0, window_batches=16):
+    def _map_pipeline_all(self, gt_dict, pred_dict, batch_size):
+        """PIPELINE 2 — whole-run mAP over ALL frames at once, the accuracy
+        counterpart of SYSTEM FPS: no windowing, one metric fed every scorable
+        frame of the run, so each frame is weighted exactly once (a sliding-window
+        mean over-weights the frames that sit in more windows).
+
+        The frame count is bounded by the ground truth, not by the video: map/label/
+        labels only the first N frames, so anything the workers processed past that
+        has no label (and no pred file) and is excluded. Returns
+        (map50_95, map50, n_matched, n_gt) or None."""
+        frames_by_batch = self._frames_by_batch(gt_dict, pred_dict, batch_size)
+        frames = sorted(fn for fns in frames_by_batch.values() for fn in fns)
+        r = self._map_for_frames(gt_dict, pred_dict, frames)
+        if r is None:
+            return None
+        m, m50, n = r
+        if m < 0:
+            return None
+        return (m, m50, n, len(gt_dict))
+
+    def _print_map_summary(self, rows):
+        """Final mAP summary, one block per pipeline, in the same framed style as
+        the FPS summary. `rows` is one dict per cluster: {cluster_id, win, all}
+        where win/all are the pipeline return tuples (or None if that pipeline had
+        nothing to score)."""
+        print("=" * 60)
+        wins = [r for r in rows if r["win"]]
+        alls = [r for r in rows if r["all"]]
+        if wins:
+            W = wins[0]["win"][3]
+            print(f"  [mAP PIPELINE 1]  sliding window, W={W} batches, step 1 batch")
+            for r in wins:
+                m, m50, nw, _ = r["win"]
+                print(f"    cluster={r['cluster_id']:<24} mAP@50:95={m:7.4f}   "
+                      f"mAP@50={m50:7.4f}   (mean of {nw} window(s))")
+            if len(wins) > 1:
+                mm = sum(r["win"][0] for r in wins) / len(wins)
+                mm50 = sum(r["win"][1] for r in wins) / len(wins)
+                print(f"    {'OVERALL':<32} mAP@50:95={mm:7.4f}   "
+                      f"mAP@50={mm50:7.4f}   (avg over {len(wins)} cluster(s))")
+        if alls:
+            n_gt = alls[0]["all"][3]
+            print(f"  [mAP PIPELINE 2]  all frames, GT-limited ({n_gt} labelled frame(s))")
+            for r in alls:
+                m, m50, n, ngt = r["all"]
+                print(f"    cluster={r['cluster_id']:<24} mAP@50:95={m:7.4f}   "
+                      f"mAP@50={m50:7.4f}   ({n}/{ngt} GT frame(s) matched)")
+            if len(alls) > 1:
+                mm = sum(r["all"][0] for r in alls) / len(alls)
+                mm50 = sum(r["all"][1] for r in alls) / len(alls)
+                print(f"    {'OVERALL':<32} mAP@50:95={mm:7.4f}   "
+                      f"mAP@50={mm50:7.4f}   (avg over {len(alls)} cluster(s))")
+        if not wins and not alls:
+            print("  [mAP]  no scorable frames — nothing to report")
+        print("=" * 60)
+
+    def _collect_map_pred(self, timeout_s=None, window_batches=None):
         """Shutdown step: drain every cloud's zipped map/pred/ directory from
         map_pred_queue (tagged with cluster_id), unpack into a per-cluster folder
         under map/pred_collected/ (write-once — a frame index already unpacked
         for a cluster is kept, never overwritten, so a second edge in the same
         cluster reprocessing the same video can't clobber it), match against this
-        server's own local map/label/ ground truth, and compute a sliding-window
-        mAP (window = `window_batches` consecutive batches) per cluster. Appends
-        one line per cluster plus an OVERALL line to map.log. Only the tier that
-        ran postprocess_yolo ever publishes here (only_edge edges, or the cloud in
+        server's own local map/label/ ground truth, then run BOTH mAP pipelines
+        over each cluster's predictions:
+
+          pipeline 1 — sliding window of `window_batches` consecutive batches,
+                       stepped one batch at a time (_map_pipeline_window)
+          pipeline 2 — every scorable frame in one metric, capped by the number
+                       of labelled frames (_map_pipeline_all)
+
+        Both are reported on the console and appended to map.log (pipeline 1 also
+        writes its per-window series to map_window.log). Only the tier that ran
+        postprocess_yolo ever publishes here (only_edge edges, or the cloud in
         split/only_cloud), so 'expected' is scoped to that tier."""
         import zipfile
         import io
         import shutil
+
+        if timeout_s is None:
+            timeout_s = float(self.map_cfg.get("collect_timeout_s", 30.0))
+        if window_batches is None:
+            window_batches = int(self.map_cfg.get("window_batches", 16))
 
         mode = self._get_mode()
         if mode == "only_edge":
@@ -592,23 +716,46 @@ class Server:
             return
 
         t_ns = time.time_ns()
-        cluster_means = []
+        rows = []
+        for cluster_id, cluster_dir in sorted(cluster_dirs.items()):
+            pred_dict = self._load_cluster_preds(cluster_dir)
+            if not pred_dict:
+                continue
+            # Pipeline 1 first: it streams its per-window lines as it goes, so the
+            # console shows progress before pipeline 2's single long compute.
+            win = self._map_pipeline_window(gt_dict, pred_dict, self.batch_size,
+                                           cluster_id, t_ns, window_batches)
+            alll = self._map_pipeline_all(gt_dict, pred_dict, self.batch_size)
+            rows.append({"cluster_id": cluster_id, "win": win, "all": alll})
+
         with open(self.map_log_path, "a") as f:
-            for cluster_id, cluster_dir in sorted(cluster_dirs.items()):
-                pred_dict = self._load_cluster_preds(cluster_dir)
-                cluster_map = self._windowed_cluster_map(gt_dict, pred_dict, self.batch_size, window_batches)
-                if cluster_map is None:
-                    continue
-                cluster_means.append(cluster_map)
-                line = (f"{t_ns} cluster={cluster_id} mAP={cluster_map:.4f} "
-                        f"(sliding window={window_batches} batches, {len(pred_dict)} frame(s))")
-                f.write(line + "\n")
-                src.Log.print_with_color(f"[mAP] {line}", "cyan")
-            if cluster_means:
-                overall = sum(cluster_means) / len(cluster_means)
-                line = f"{t_ns} OVERALL mAP={overall:.4f} (avg over {len(cluster_means)} cluster(s))"
-                f.write(line + "\n")
-                src.Log.print_with_color(f"[mAP] {line}", "cyan")
+            for r in rows:
+                if r["win"]:
+                    m, m50, nw, W = r["win"]
+                    line = (f"{t_ns} cluster={r['cluster_id']} WINDOW "
+                            f"mAP50_95={m:.4f} mAP50={m50:.4f} "
+                            f"(mean of {nw} window(s) x {W} batches, step 1)")
+                    f.write(line + "\n")
+                if r["all"]:
+                    m, m50, n, ngt = r["all"]
+                    line = (f"{t_ns} cluster={r['cluster_id']} ALL "
+                            f"mAP50_95={m:.4f} mAP50={m50:.4f} "
+                            f"({n}/{ngt} GT frame(s) matched)")
+                    f.write(line + "\n")
+            # OVERALL goes in the log whenever at least one cluster scored, even
+            # with a single cluster (where it just repeats that cluster's numbers) —
+            # this is the machine-read file, so a parser can always find one
+            # authoritative line per pipeline. The console summary omits it in the
+            # single-cluster case, where it would only be visual duplication.
+            for key, tag in (("win", "WINDOW"), ("all", "ALL")):
+                vals = [r[key] for r in rows if r[key]]
+                if vals:
+                    m = sum(v[0] for v in vals) / len(vals)
+                    m50 = sum(v[1] for v in vals) / len(vals)
+                    f.write(f"{t_ns} OVERALL {tag} mAP50_95={m:.4f} mAP50={m50:.4f} "
+                            f"(avg over {len(vals)} cluster(s))\n")
+
+        self._print_map_summary(rows)
 
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"

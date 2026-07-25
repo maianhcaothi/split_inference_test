@@ -1,6 +1,6 @@
 name: YOLO
 server:
-  cut-layer: a # or b, c, d
+  cut-layer: b # or b, c, d
   clients:
     - 9 #edge
     - 3 #cloud
@@ -17,7 +17,7 @@ rabbit:
   virtual-host: /
 
 debug-mode: False
-data: video.mp4
+data: videohungyen.mp4
 log-path: .
 compress:
   enable: True
@@ -45,8 +45,12 @@ backpressure:
 detections:
   save_json: True         # ghi detections.json khi kết thúc (đọc streaming từ jsonl → RAM phẳng). False = bỏ qua.
 
+map:                      # 2 pipeline mAP chạy ở Server lúc shutdown (ground truth = map/label/)
+  window_batches: 16      # pipeline 1: cửa sổ trượt gồm N batch liên tiếp, dịch 1 batch mỗi bước → map_window.log
+  collect_timeout_s: 30   # thời gian chờ tối đa để thu đủ zip map/pred/ từ các cloud/edge
+
 adaptive:
-  enable: True            # chỉ hoạt động ở mode: split. Server nudge cut point theo độ sâu queue.
+  enable: False            # chỉ hoạt động ở mode: split. Server nudge cut point theo độ sâu queue.
   batches_per_check: 20   # N: đánh giá lại sau mỗi N batch được xử lý (đếm qua management API)
   high_threshold: 8       # queue depth >= giá trị này → coi là "overflow"
   low_threshold: 1        # queue depth <= giá trị này → coi là "empty"

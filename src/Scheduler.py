@@ -26,6 +26,19 @@ MAX_QUEUE_ONLY_CLOUD = 15
 # None, which is the stream-end sentinel put into the pipeline queues.
 _MT_EMPTY = object()
 
+
+def _cap_samples(vals, cap=20000):
+    """Round latency samples for the wire, taking an even stride if a run produced
+    absurdly many. An even stride preserves the shape of the distribution (so the
+    server's percentiles stay representative) while keeping a multi-hour run from
+    turning its shutdown report into a multi-megabyte message. Typical runs are
+    far under the cap and pass through untouched."""
+    if len(vals) <= cap:
+        return [round(v, 3) for v in vals]
+    step = len(vals) / cap
+    return [round(vals[int(i * step)], 3) for i in range(cap)]
+
+
 class Scheduler:
     def __init__(self, client_id, layer_id, channel, device):
         self.client_id = client_id
@@ -98,6 +111,14 @@ class Scheduler:
         # and Server._collect_map_pred.
         self.map_pred_queue = "map_pred_queue"
         self.channel.queue_declare(self.map_pred_queue, durable=False)
+        # Per-batch latency samples, harvested in write_metrics (the one choke
+        # point every path already funnels through) and shipped to the server in
+        # this device's shutdown report, so the server can break latency down per
+        # cluster as well as system-wide. Raw samples, not pre-reduced stats:
+        # percentiles cannot be pooled across devices after the fact, and a run's
+        # worth of floats is a trivially small message.
+        self._lat_ms = []   # own-clock service latency (get input -> output)
+        self._e2e_ms = []   # edge start -> this device's output (crosses devices)
         self._load_gt_dict()
 
     def get_ram_mb(self):
@@ -171,6 +192,16 @@ class Scheduler:
                 round(e2e_latency_ms, 3),
                 edge_start_time if edge_start_time is not None else "",
             ])
+
+        # Same numbers the CSV row just recorded, kept in memory for this device's
+        # shutdown latency report. Every path (edge/cloud, sequential/threaded)
+        # calls write_metrics, so hooking here covers them all with one line.
+        # e2e is 0 on the edge (only the completing tier can know it) — drop those
+        # so they don't drag the mean toward zero.
+        if latency_ms:
+            self._lat_ms.append(float(latency_ms))
+        if e2e_latency_ms:
+            self._e2e_ms.append(float(e2e_latency_ms))
 
     def _setup_metrics_fanout_queue(self):
         """Cloud client gọi trước khi inference: tạo queue riêng bind vào fanout exchange.
@@ -386,16 +417,21 @@ class Scheduler:
                                    body=pickle.dumps(message))
 
     def _send_fps_done(self):
-        """Publish exactly one bare b"DONE" to fps_queue per finished batch. The
-        tier that COMPLETES the batch sends it (cloud in split/only_cloud, edge in
-        only_edge) — never both, so one DONE == exactly batch_size frames. The
-        server never reads the body; the arrival itself is the event. Must be
-        called on the channel-owning thread (pika channels aren't thread-safe)."""
+        """Publish exactly one DONE to fps_queue per finished batch. The tier that
+        COMPLETES the batch sends it (cloud in split/only_cloud, edge in only_edge)
+        — never both, so one DONE == exactly batch_size frames.
+
+        The body carries this cluster's id so the server can break throughput down
+        per cluster on top of the system total. It is an identity only: timing
+        still comes purely from the server's arrival clock, so no device clocks
+        need syncing and a garbled body can at worst mis-bucket a batch, never
+        distort a rate. Must be called on the channel-owning thread (pika channels
+        aren't thread-safe)."""
         try:
             self.channel.basic_publish(
                 exchange='',
                 routing_key=self.fps_queue,
-                body=b"DONE",
+                body=str(self.intermediate_queue).encode(),
             )
         except Exception as e:
             Log.print_with_color(f"[FPS] send DONE failed: {e}", "yellow")
@@ -453,6 +489,11 @@ class Scheduler:
             "busy_ns": busy_ns,
             "total_ns": total_ns,
             "utilization": busy_ns / total_ns,
+            # Which cluster this device belongs to, so the server can group both
+            # utilization and latency per cluster instead of per device only.
+            "cluster_id": self.intermediate_queue,
+            "lat_samples_ms": _cap_samples(self._lat_ms),
+            "e2e_samples_ms": _cap_samples(self._e2e_ms),
         }
         Log.print_with_color(
             f"[Utilization][{role}] packages={n_packages} "

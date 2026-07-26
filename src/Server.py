@@ -20,6 +20,71 @@ from src.Clustering import (
     get_raw_input_mb,
 )
 
+_MAP_BACKEND_ERR = None   # set once, the first time the metric can't be built
+_MAP_WARNED = set()       # messages already printed, so per-window calls don't spam
+
+
+def _map_warn_once(msg, color="red"):
+    if msg not in _MAP_WARNED:
+        _MAP_WARNED.add(msg)
+        src.Log.print_with_color(msg, color)
+
+
+def _new_map_metric():
+    """A fresh MeanAveragePrecision, or None (reason logged once) if mAP can't run.
+
+    Three separate ways this fails, all of them handled here because each one
+    otherwise surfaces late and destructively:
+
+      1. torchmetrics not installed        -> ImportError on the import;
+      2. no COCO backend installed         -> ImportError from the CONSTRUCTOR,
+         not the import, so guarding only the import lets a fully finished run
+         die at shutdown, losing the mAP and the clean disconnect;
+      3. backend installed but not the one torchmetrics defaults to — it
+         hardcodes backend="pycocotools" and only checks inside compute(), i.e.
+         AFTER a whole run's worth of updates. So the backend is chosen here from
+         what is actually importable.
+
+    pycocotools is preferred when present (it's the reference implementation);
+    faster-coco-eval is the drop-in fallback and needs no MSVC toolchain on
+    Windows. They agree numerically, but keep the same one installed on every
+    device so numbers stay strictly comparable.
+
+    Each window needs its own metric (they accumulate state), so this runs many
+    times per report — hence the cached failure flag."""
+    global _MAP_BACKEND_ERR
+    if _MAP_BACKEND_ERR is not None:
+        return None
+    try:
+        from torchmetrics.detection import MeanAveragePrecision
+    except ImportError as e:
+        _MAP_BACKEND_ERR = str(e)
+        _map_warn_once(f"[mAP] disabled — {e}")
+        _map_warn_once("[mAP] fix: pip install torchmetrics faster-coco-eval", "yellow")
+        return None
+
+    import importlib.util
+    backend = next((b for b in ("pycocotools", "faster_coco_eval")
+                    if importlib.util.find_spec(b)), None)
+    if backend is None:
+        _MAP_BACKEND_ERR = "no COCO backend installed (pycocotools / faster-coco-eval)"
+        _map_warn_once(f"[mAP] disabled — {_MAP_BACKEND_ERR}")
+        _map_warn_once("[mAP] fix: pip install faster-coco-eval", "yellow")
+        return None
+    try:
+        metric = MeanAveragePrecision(iou_type="bbox", backend=backend)
+    except TypeError:
+        # torchmetrics < 1.3 predates the `backend` kwarg (pycocotools only).
+        metric = MeanAveragePrecision(iou_type="bbox")
+    except ImportError as e:
+        _MAP_BACKEND_ERR = str(e)
+        _map_warn_once(f"[mAP] disabled — {e}")
+        return None
+    _map_warn_once(f"[mAP] backend: {backend}", "green")
+    metric.warn_on_many_detections = False
+    return metric
+
+
 class Server:
     def __init__(self, config):
         # One-time cleanup of shared metrics/lock files from a previous run.
@@ -119,6 +184,11 @@ class Server:
         self.channel.queue_declare(queue='map_pred_queue', durable=False)
         self.channel.queue_purge(queue='map_pred_queue')
         self._fps_times = []       # arrival time of every DONE (one per batch)
+        # Same arrivals, bucketed by the cluster that produced them (the DONE body
+        # carries the cluster id — see Scheduler._send_fps_done). The system list
+        # above stays the authoritative total; this is purely an added breakdown,
+        # so a mis-tagged DONE can never change the system number.
+        self._fps_by_cluster = {}  # {cluster_id: [arrival_s, ...]}
         self._fps_start_t = None   # when START was broadcast (system-fps t0)
         self._fps_printed = False
         # Shutdown: after the edges finish the clouds keep draining their backlog,
@@ -163,6 +233,20 @@ class Server:
         # _collect_utilization at shutdown. Truncated here so runs never mix.
         self.util_log_path = f"{log_path}/utilization.log"
         open(self.util_log_path, "w").close()
+        # ── per-cluster breakdowns (the system-wide files above are unchanged) ──
+        # Every DONE, tagged with its cluster + that cluster's live window fps.
+        # The plottable per-cluster throughput series; batch_done_ns.log keeps its
+        # documented two-column format so existing parsers still work.
+        self.fps_cluster_ns_log_path = f"{log_path}/fps_cluster_ns.log"
+        open(self.fps_cluster_ns_log_path, "w").close()
+        # One line per cluster + a SYSTEM line, written by _finish_fps.
+        self.fps_cluster_log_path = f"{log_path}/fps_cluster.log"
+        open(self.fps_cluster_log_path, "w").close()
+        # One line per cluster/role + a SYSTEM line, written by _collect_utilization.
+        self.util_cluster_log_path = f"{log_path}/utilization_cluster.log"
+        open(self.util_cluster_log_path, "w").close()
+        self.latency_cluster_log_path = f"{log_path}/latency_cluster.log"
+        open(self.latency_cluster_log_path, "w").close()
         # mAP summary: two lines per cluster (WINDOW = pipeline 1, ALL = pipeline 2)
         # plus one OVERALL line per pipeline, appended by _collect_map_pred at
         # shutdown. Truncated here so runs never mix.
@@ -268,15 +352,20 @@ class Server:
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def on_fps(self, ch, method, _, body):
-        """Consumer for fps_queue. Every message is one finished batch — the body
-        (bare b"DONE") is never read; the ARRIVAL is the event. We just record the
-        server-clock arrival time; all throughput math happens in _finish_fps.
-        A smoothed window_fps is logged live so progress is visible during the run.
-        Each arrival is also appended to batch_done_ns.log as "<ns-epoch> <fps>",
-        one line per batch — the fps column holds the bare window_fps value and
-        is absent until the first full window."""
+        """Consumer for fps_queue. Every message is one finished batch and the
+        ARRIVAL is the event — we record the server-clock arrival time and all
+        throughput math happens in _finish_fps. Timing never depends on the body,
+        so device clocks still need no syncing.
+
+        The body carries the producing cluster's id, used only to bucket the
+        arrival for the per-cluster breakdown. A smoothed window_fps is logged live
+        (system-wide) so progress is visible during the run; each arrival is
+        appended to batch_done_ns.log as "<ns-epoch> <fps>" (unchanged format) and
+        to fps_cluster_ns.log with its cluster tag and that cluster's own window
+        fps."""
         t_ns = time.time_ns()
-        self._fps_times.append(t_ns / 1e9)
+        t_s = t_ns / 1e9
+        self._fps_times.append(t_s)
         n = len(self._fps_times)
         W = self._fps_window
         window_fps = None
@@ -292,6 +381,29 @@ class Server:
                 f.write(f"{t_ns}\n")
             else:
                 f.write(f"{t_ns} {window_fps:.2f}\n")
+
+        # Per-cluster bucket. A producer that predates the tagged body sends
+        # b"DONE" — bucket it as 'unknown' rather than dropping it, so the
+        # breakdown degrades to one lump instead of silently losing batches.
+        try:
+            tag = body.decode("utf-8", "replace").strip()
+        except Exception:
+            tag = ""
+        if not tag or tag == "DONE":
+            tag = "unknown"
+        ct = self._fps_by_cluster.setdefault(tag, [])
+        ct.append(t_s)
+        nc = len(ct)
+        cluster_fps = None
+        if nc >= W:
+            span_c = ct[-1] - ct[-W]
+            if span_c > 0:
+                cluster_fps = (W - 1) * self.batch_size / span_c
+        with open(self.fps_cluster_ns_log_path, "a") as f:
+            if cluster_fps is None:
+                f.write(f"{t_ns} cluster={tag} done={nc}\n")
+            else:
+                f.write(f"{t_ns} cluster={tag} done={nc} window_fps={cluster_fps:.2f}\n")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _fps_total_work_depth(self):
@@ -339,6 +451,48 @@ class Server:
         except Exception:
             self._finish_fps("scheduler unavailable")
 
+    def _report_cluster_fps(self):
+        """Per-cluster throughput breakdown, printed under the system summary and
+        written to fps_cluster.log (one line per cluster + a SYSTEM line).
+
+        Each cluster gets the same two measures as the system: whole-run fps from
+        the shared START (so the numbers are additive — they sum to roughly the
+        system fps, exactly so when the clusters finish together) and steady-state
+        fps across that cluster's own first->last DONE, which drops its warm-up and
+        is the fair number for comparing one cluster against another.
+
+        'share' is the cluster's portion of all batches — the quickest read on
+        whether the Hungarian assignment actually balanced the clusters."""
+        by_cluster = self._fps_by_cluster
+        n_total = len(self._fps_times)
+        if not by_cluster or n_total == 0:
+            return
+        bs = self.batch_size
+        start = self._fps_start_t
+        t_ns = time.time_ns()
+        lines = []
+        print("  " + "-" * 56)
+        for tag, ts in sorted(by_cluster.items()):
+            nc = len(ts)
+            share = 100.0 * nc / n_total
+            fps_c = nc * bs / (ts[-1] - start) if start and ts[-1] > start else 0.0
+            steady_c = ((nc - 1) * bs / (ts[-1] - ts[0])
+                        if nc >= 2 and ts[-1] > ts[0] else 0.0)
+            print(f"  [cluster] {tag:<24} {fps_c:8.3f} fps   "
+                  f"steady={steady_c:8.3f}   {nc} DONE x {bs}   share={share:5.1f}%")
+            lines.append(
+                f"{t_ns} cluster={tag} fps={fps_c:.3f} steady_fps={steady_c:.3f} "
+                f"done={nc} frames={nc * bs} share={share:.1f}%")
+        sys_fps = (n_total * bs / (self._fps_times[-1] - start)
+                   if start and self._fps_times[-1] > start else 0.0)
+        lines.append(f"{t_ns} SYSTEM fps={sys_fps:.3f} done={n_total} "
+                     f"frames={n_total * bs} clusters={len(by_cluster)}")
+        try:
+            with open(self.fps_cluster_log_path, "a") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            src.Log.print_with_color(f"[FPS] cluster log write failed: {e}", "yellow")
+
     def _finish_fps(self, reason=""):
         """Print the system-FPS summary once and stop the server's consumer.
         Idempotent — whichever of drain-grace / hard-cap fires first wins."""
@@ -375,6 +529,7 @@ class Server:
         else:
             print("  [SYSTEM FPS]      no DONEs received — nothing to report")
         print(f"  batches counted: {n}   stop reason: {reason}")
+        self._report_cluster_fps()
         print("=" * 60)
         try:
             self.channel.stop_consuming()
@@ -390,6 +545,7 @@ class Server:
         warning and the run still shuts down cleanly."""
         expected = len(self.registered_ids)
         reported = set()
+        reports = []            # kept for the per-cluster utilization/latency roll-up
         deadline = time.time() + timeout_s
         while len(reported) < expected and time.time() < deadline:
             method_frame, _, body = self.channel.basic_get(queue='utilization_queue', auto_ack=True)
@@ -405,6 +561,7 @@ class Server:
             t_ns = time.time_ns()   # server-clock arrival timestamp for the log line
             client_id = msg.get("client_id")
             reported.add(str(client_id))
+            reports.append(msg)
             line = (f"{t_ns} client={client_id} role={msg.get('role')} "
                     f"packages={msg.get('packages')} "
                     f"busy_s={msg.get('busy_ns', 0) / 1e9:.3f} "
@@ -416,6 +573,133 @@ class Server:
         if len(reported) < expected:
             src.Log.print_with_color(
                 f"[Utilization] Collected {len(reported)}/{expected} reports before timeout", "yellow")
+        self._report_cluster_util_latency(reports)
+
+    @staticmethod
+    def _stats_ms(vals):
+        """n / mean / p50 / p95 / max over pooled latency samples, or None if empty.
+        Nearest-rank percentiles over the sorted samples — no interpolation, so
+        every number reported is a latency that was actually observed. Pooling the
+        raw samples (rather than averaging per-device percentiles, which is not a
+        valid operation) is why the devices ship samples instead of summaries."""
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+
+        def pct(q):
+            return s[min(n - 1, max(0, int(round((n - 1) * q))))]
+
+        return {"n": n, "mean": sum(s) / n, "p50": pct(0.50), "p95": pct(0.95), "max": s[-1]}
+
+    def _report_cluster_util_latency(self, reports):
+        """Roll the shutdown reports up per cluster into utilization_cluster.log and
+        latency_cluster.log, plus a console block. utilization.log keeps its
+        per-device view untouched — this adds the grouping, it doesn't replace it.
+
+        Utilization is reported pooled (sum busy / sum total across the group),
+        which weights each device by how long it actually ran; the plain mean of
+        the per-device ratios is printed alongside, since a pooled number can hide
+        one idle device in a group of busy ones.
+
+        Latency comes in two flavours and they answer different questions:
+          * per-role service latency — each device's own get_input -> output, one
+            clock, so it is exact;
+          * E2E — edge batch start -> completing tier's output. It spans two
+            machines, so it inherits any clock offset between them. Only the
+            completing tier reports it, hence one E2E series per cluster.
+        """
+        if not reports:
+            return
+        t_ns = time.time_ns()
+        by_cluster = {}
+        for r in reports:
+            by_cluster.setdefault(str(r.get("cluster_id", "unknown")), []).append(r)
+
+        util_lines, lat_lines = [], []
+        all_busy = all_total = 0
+        all_ratios, all_e2e = [], []
+        print("=" * 60)
+        print("  [PER-CLUSTER UTILIZATION & LATENCY]")
+        for tag, rs in sorted(by_cluster.items()):
+            busy = sum(r.get("busy_ns", 0) for r in rs)
+            total = sum(r.get("total_ns", 0) for r in rs)
+            ratios = [r.get("utilization", 0.0) for r in rs]
+            all_busy += busy
+            all_total += total
+            all_ratios += ratios
+            pooled = busy / total if total else 0.0
+            mean_r = sum(ratios) / len(ratios) if ratios else 0.0
+            print(f"  [cluster] {tag:<24} devices={len(rs)}  "
+                  f"utilization={pooled * 100:6.2f}%  (mean of devices={mean_r * 100:6.2f}%)")
+            util_lines.append(
+                f"{t_ns} cluster={tag} ALL devices={len(rs)} "
+                f"utilization={pooled * 100:.2f}% utilization_mean={mean_r * 100:.2f}% "
+                f"busy_s={busy / 1e9:.3f} total_s={total / 1e9:.3f} "
+                f"packages={sum(r.get('packages', 0) for r in rs)}")
+
+            by_role = {}
+            for r in rs:
+                by_role.setdefault(str(r.get("role", "unknown")), []).append(r)
+            for role, rr in sorted(by_role.items()):
+                b = sum(r.get("busy_ns", 0) for r in rr)
+                tt = sum(r.get("total_ns", 0) for r in rr)
+                util_lines.append(
+                    f"{t_ns} cluster={tag} role={role} devices={len(rr)} "
+                    f"utilization={(b / tt * 100) if tt else 0.0:.2f}% "
+                    f"busy_s={b / 1e9:.3f} total_s={tt / 1e9:.3f} "
+                    f"packages={sum(r.get('packages', 0) for r in rr)}")
+                st = self._stats_ms([v for r in rr for v in r.get("lat_samples_ms", [])])
+                if st:
+                    print(f"      {role:<8} service latency  n={st['n']:<5} "
+                          f"mean={st['mean']:8.1f}ms  p50={st['p50']:8.1f}  "
+                          f"p95={st['p95']:8.1f}  max={st['max']:8.1f}")
+                    lat_lines.append(
+                        f"{t_ns} cluster={tag} role={role} kind=service n={st['n']} "
+                        f"mean_ms={st['mean']:.3f} p50_ms={st['p50']:.3f} "
+                        f"p95_ms={st['p95']:.3f} max_ms={st['max']:.3f}")
+
+            e2e = [v for r in rs for v in r.get("e2e_samples_ms", [])]
+            all_e2e += e2e
+            st = self._stats_ms(e2e)
+            if st:
+                print(f"      {'E2E':<8} pipeline latency n={st['n']:<5} "
+                      f"mean={st['mean']:8.1f}ms  p50={st['p50']:8.1f}  "
+                      f"p95={st['p95']:8.1f}  max={st['max']:8.1f}")
+                lat_lines.append(
+                    f"{t_ns} cluster={tag} kind=e2e n={st['n']} "
+                    f"mean_ms={st['mean']:.3f} p50_ms={st['p50']:.3f} "
+                    f"p95_ms={st['p95']:.3f} max_ms={st['max']:.3f}")
+
+        # System-wide lines: the whole point is that the per-cluster breakdown
+        # never replaces the total, so both files end with one.
+        pooled_all = all_busy / all_total if all_total else 0.0
+        mean_all = sum(all_ratios) / len(all_ratios) if all_ratios else 0.0
+        print(f"  [SYSTEM]  devices={len(reports)}  clusters={len(by_cluster)}  "
+              f"utilization={pooled_all * 100:6.2f}%  (mean of devices={mean_all * 100:6.2f}%)")
+        util_lines.append(
+            f"{t_ns} SYSTEM devices={len(reports)} clusters={len(by_cluster)} "
+            f"utilization={pooled_all * 100:.2f}% utilization_mean={mean_all * 100:.2f}% "
+            f"busy_s={all_busy / 1e9:.3f} total_s={all_total / 1e9:.3f}")
+        st = self._stats_ms(all_e2e)
+        if st:
+            print(f"  [SYSTEM]  E2E pipeline latency  n={st['n']:<5} "
+                  f"mean={st['mean']:8.1f}ms  p50={st['p50']:8.1f}  "
+                  f"p95={st['p95']:8.1f}  max={st['max']:8.1f}")
+            lat_lines.append(
+                f"{t_ns} SYSTEM kind=e2e n={st['n']} mean_ms={st['mean']:.3f} "
+                f"p50_ms={st['p50']:.3f} p95_ms={st['p95']:.3f} max_ms={st['max']:.3f}")
+        print("=" * 60)
+
+        for path, lines in ((self.util_cluster_log_path, util_lines),
+                            (self.latency_cluster_log_path, lat_lines)):
+            if not lines:
+                continue
+            try:
+                with open(path, "a") as f:
+                    f.write("\n".join(lines) + "\n")
+            except Exception as e:
+                src.Log.print_with_color(f"[Utilization] log write failed ({path}): {e}", "yellow")
 
     def _load_map_label_gt(self, gt_dir="map/label"):
         """Ground truth for server-side mAP: this server's own local copy of
@@ -485,17 +769,15 @@ class Server:
     def _map_for_frames(self, gt_dict, pred_dict, frames):
         """mAP@50:95 and mAP@50 over exactly `frames` (frame numbers that exist in
         BOTH pred_dict and gt_dict). Returns (map50_95, map50, n_frames), or None
-        if torchmetrics is missing / the compute failed.
+        if the metric is unavailable (see _new_map_metric) or the compute failed.
 
         Both pipelines below are just different framings of this one call, which is
         why they are guaranteed comparable. torchmetrics takes parallel lists, so
         this updates once with every frame instead of once per frame — with a
         sliding window the same frame is scored in up to W windows, and per-frame
         update() calls dominate the runtime."""
-        try:
-            from torchmetrics.detection import MeanAveragePrecision
-        except ImportError:
-            src.Log.print_with_color("[mAP] torchmetrics not installed on server, mAP disabled", "red")
+        metric = _new_map_metric()
+        if metric is None:
             return None
         preds, targets = [], []
         for fn in frames:
@@ -505,13 +787,13 @@ class Server:
             targets.append(gt_dict[fn])
         if not preds:
             return None
-        metric = MeanAveragePrecision(iou_type="bbox")
-        metric.warn_on_many_detections = False
         metric.update(preds, targets)
         try:
             res = metric.compute()
         except Exception as e:
-            src.Log.print_with_color(f"[mAP] compute failed: {e}", "red")
+            # Once per distinct message: this runs per window, so a systemic
+            # failure would otherwise print the same line a dozen-plus times.
+            _map_warn_once(f"[mAP] compute failed: {e}")
             return None
         return float(res["map"]), float(res["map_50"]), len(preds)
 
@@ -629,7 +911,13 @@ class Server:
                 print(f"    {'OVERALL':<32} mAP@50:95={mm:7.4f}   "
                       f"mAP@50={mm50:7.4f}   (avg over {len(alls)} cluster(s))")
         if not wins and not alls:
-            print("  [mAP]  no scorable frames — nothing to report")
+            # Distinguish "ran, found nothing to score" from "couldn't run at all" —
+            # they look identical here but need completely different fixes.
+            if _MAP_BACKEND_ERR:
+                print("  [mAP]  unavailable — torchmetrics has no COCO backend "
+                      "(pip install faster-coco-eval)")
+            else:
+                print("  [mAP]  no scorable frames — nothing to report")
         print("=" * 60)
 
     def _collect_map_pred(self, timeout_s=None, window_batches=None):

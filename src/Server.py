@@ -1045,6 +1045,76 @@ class Server:
 
         self._print_map_summary(rows)
 
+    # ─── Run archive ──────────────────────────────────────────────────────────
+
+    def _run_tag(self):
+        """Which configuration produced this run — the suffix of the archive dir.
+
+        A non-split run is tagged with its experiment mode (only_cloud /
+        only_edge). A split run is 'dynamic' when the adaptive controller was
+        free to move the cut point during the run, and 'split' when the cut
+        stayed where clustering / cut-layer put it.
+        """
+        mode = self._get_mode()
+        if mode != "split":
+            return mode
+        return "dynamic" if self.adaptive_cfg.get("enable", False) else "split"
+
+    def _archive_results(self):
+        """Gather this run's result logs into results/results_<MMDD>_<HHMM>_<tag>/.
+
+        Called once, after the last shutdown pipeline (mAP) has written its
+        files, so the archive is a complete snapshot of the run.
+
+        Copies rather than moves: log-path keeps its own copies where every
+        existing reader expects them, and the next run truncates them itself
+        (see __init__) instead of starting against a half-empty directory.
+        """
+        import shutil
+        # Everything a run produces. cut_change_ns.log only exists when the
+        # adaptive controller ran; empty files are skipped rather than archived
+        # as misleading zero-length results.
+        result_files = (
+            "batch_done_ns.log",
+            "fps_cluster.log",
+            "fps_cluster_ns.log",
+            "latency_cluster.log",
+            "map.log",
+            "map_window.log",
+            "utilization.log",
+            "utilization_cluster.log",
+            "cut_change_ns.log",
+        )
+        log_path = self.config["log-path"]
+        base = os.path.join(log_path, "results",
+                            f"results_{time.strftime('%m%d_%H%M')}_{self._run_tag()}")
+        # Two runs finishing inside the same minute must not overwrite each other.
+        out_dir, n = base, 2
+        while os.path.exists(out_dir):
+            out_dir, n = f"{base}-{n}", n + 1
+        os.makedirs(out_dir)
+
+        copied = []
+        for name in result_files:
+            path = os.path.join(log_path, name)
+            if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                continue
+            shutil.copy2(path, os.path.join(out_dir, name))
+            copied.append(name)
+        # The config that produced these numbers, so the archive reads on its own
+        # months later without having to guess the cut/batch/cluster settings.
+        try:
+            shutil.copy2("config.yaml", os.path.join(out_dir, "config.yaml"))
+        except OSError as e:
+            src.Log.print_with_color(f"[Archive] config.yaml not copied: {e}", "yellow")
+
+        src.Log.print_with_color(
+            f"[Archive] {len(copied)} result file(s) -> {out_dir}", "green")
+        if not copied:
+            src.Log.print_with_color(
+                "[Archive] WARNING: every result log was missing or empty", "yellow")
+        return out_dir
+
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"
         self.reply_channel.queue_declare(reply_queue_name, durable=False)
@@ -1058,6 +1128,13 @@ class Server:
         # before closing the connection.
         self._collect_utilization()
         self._collect_map_pred()
+        # Every result file is final by here — snapshot them into one run folder.
+        # Guarded so a filesystem problem in the archive can't leave the broker
+        # connection open or skip the clean exit.
+        try:
+            self._archive_results()
+        except Exception as e:
+            src.Log.print_with_color(f"[Archive] failed: {e}", "red")
         self.connection.close()
         sys.exit(0)
 

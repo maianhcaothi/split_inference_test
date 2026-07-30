@@ -149,6 +149,9 @@ class Server:
             )
         )
         self.channel = self.connection.channel()
+
+        self._assert_only_server()
+
         self.channel.queue_declare(queue='rpc_queue', durable=False)
         self.channel.queue_purge(queue='rpc_queue')
 
@@ -216,7 +219,15 @@ class Server:
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
         self.channel.basic_consume(queue='rpc_queue', on_message_callback=self.on_request)
-        self.channel.basic_consume(queue='fps_queue', on_message_callback=self.on_fps)
+        # exclusive=True is the race-proof half of _assert_only_server: the
+        # pre-flight consumer_count check can't see a server that is starting up
+        # at the same moment, but the broker will only ever grant this claim once.
+        try:
+            self.channel.basic_consume(queue='fps_queue',
+                                       on_message_callback=self.on_fps,
+                                       exclusive=True)
+        except Exception as e:
+            self._fatal_second_server(f"exclusive consume on 'fps_queue' refused: {e}")
 
         self.data = config["data"]
         self.compress = config["compress"]
@@ -266,6 +277,37 @@ class Server:
             open(self.cut_log_path, "w").close()
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
+
+    def _fatal_second_server(self, detail):
+        """Abort: another server owns this broker. Never degrade to a warning —
+        two servers silently divide every meter between them."""
+        src.Log.print_with_color(
+            f"[FATAL] A server is already running against this broker ({detail}).\n"
+            "        Two servers round-robin the DONE stream, so each one counts "
+            "only its share and every FPS number reads low by the number of live "
+            "servers (a run with 4 servers reported 5.5 fps instead of 22.5).\n"
+            "        Kill the leftover server process(es), then start again.",
+            "red")
+        sys.exit(1)
+
+    def _assert_only_server(self):
+        """Refuse to start if another server is already consuming 'fps_queue'.
+
+        Read-only on purpose, and called BEFORE the queue_purge block below: a
+        losing second server must exit without having touched the winner's
+        in-flight state. A passive declare on a queue that doesn't exist yet is
+        the normal first-run case (nothing to collide with) and closes the
+        channel, so the channel is reopened before returning."""
+        try:
+            res = self.channel.queue_declare(queue='fps_queue', passive=True)
+        except Exception:
+            # 404: no 'fps_queue' yet -> no other server. The broker closed the
+            # channel to report it, so replace it before anyone else uses it.
+            self.channel = self.connection.channel()
+            return
+        n = res.method.consumer_count
+        if n > 0:
+            self._fatal_second_server(f"'fps_queue' already has {n} consumer(s)")
 
     def _get_mode(self):
         exp = self.config.get("experiment", {})
@@ -602,10 +644,14 @@ class Server:
         the per-device ratios is printed alongside, since a pooled number can hide
         one idle device in a group of busy ones.
 
-        Latency comes in two flavours and they answer different questions:
-          * per-role service latency — each device's own get_input -> output, one
-            clock, so it is exact;
-          * E2E — edge batch start -> completing tier's output. It spans two
+        Latency comes in three flavours and they answer different questions:
+          * kind=service — each device's own get_input -> output, one clock, so it
+            is exact. Its samples sum to that role's busy_s, which makes it the
+            only one comparable against utilization;
+          * kind=pipeline — batch ready -> published. Same clock, but on the edge
+            it also contains the wait in the two hand-off queues, so it tracks
+            queue_size rather than device speed. This is what feeds E2E;
+          * kind=e2e — edge batch start -> completing tier's output. It spans two
             machines, so it inherits any clock offset between them. Only the
             completing tier reports it, hence one E2E series per cluster.
         """
@@ -649,13 +695,23 @@ class Server:
                     f"utilization={(b / tt * 100) if tt else 0.0:.2f}% "
                     f"busy_s={b / 1e9:.3f} total_s={tt / 1e9:.3f} "
                     f"packages={sum(r.get('packages', 0) for r in rr)}")
-                st = self._stats_ms([v for r in rr for v in r.get("lat_samples_ms", [])])
-                if st:
-                    print(f"      {role:<8} service latency  n={st['n']:<5} "
+                # Two per-role series, and mixing them up is the whole reason for
+                # reporting both:
+                #   service  = get_input -> output, the device's own compute. Sums
+                #              to exactly the busy_s on the line above.
+                #   pipeline = batch ready -> published, so on the edge it also
+                #              carries the wait in the two hand-off queues. It is
+                #              the number that explains e2e, not the device's speed.
+                for kind, key, label in (("service", "svc_samples_ms", "service "),
+                                         ("pipeline", "lat_samples_ms", "pipeline")):
+                    st = self._stats_ms([v for r in rr for v in r.get(key, [])])
+                    if not st:
+                        continue
+                    print(f"      {role:<8} {label} latency n={st['n']:<5} "
                           f"mean={st['mean']:8.1f}ms  p50={st['p50']:8.1f}  "
                           f"p95={st['p95']:8.1f}  max={st['max']:8.1f}")
                     lat_lines.append(
-                        f"{t_ns} cluster={tag} role={role} kind=service n={st['n']} "
+                        f"{t_ns} cluster={tag} role={role} kind={kind} n={st['n']} "
                         f"mean_ms={st['mean']:.3f} p50_ms={st['p50']:.3f} "
                         f"p95_ms={st['p95']:.3f} max_ms={st['max']:.3f}")
 
@@ -1094,13 +1150,50 @@ class Server:
             out_dir, n = f"{base}-{n}", n + 1
         os.makedirs(out_dir)
 
+        # cut_change_ns.log is only truncated when the adaptive controller runs
+        # (see __init__), so with adaptive off the file still holds the PREVIOUS
+        # adaptive run's changes. Archiving it then produces a result folder whose
+        # cut log describes a different run — the 0730_0917 split archive shipped
+        # cut changes for an intermediate_queue_2 that run never had. A run with no
+        # controller has no cut changes, so the honest archive omits the file.
+        skip = set()
+        if not self.adaptive_cfg.get("enable", False):
+            skip.add("cut_change_ns.log")
+
         copied = []
         for name in result_files:
+            if name in skip:
+                continue
             path = os.path.join(log_path, name)
             if not os.path.isfile(path) or os.path.getsize(path) == 0:
                 continue
             shutil.copy2(path, os.path.join(out_dir, name))
             copied.append(name)
+
+        # Per-batch metrics (metrics_raw_<queue>_<clientid>.csv, written by
+        # Scheduler.write_metrics) are the ONLY record of per-batch message size,
+        # cut and latency. Without them a run's summary logs can show a shared
+        # bottleneck without saying what saturated — diagnosing the 0730 edge
+        # ceiling needed exactly this file and it had never been archived. Only
+        # devices that share the server's filesystem contribute; the rest keep
+        # theirs locally, which is why this is best-effort and never fatal.
+        raw = sorted(glob.glob(os.path.join(log_path, "metrics_raw_*.csv")))
+        if raw:
+            raw_dir = os.path.join(out_dir, "metrics_raw")
+            try:
+                os.makedirs(raw_dir, exist_ok=True)
+                for path in raw:
+                    if os.path.getsize(path) == 0:
+                        continue
+                    shutil.copy2(path, os.path.join(raw_dir, os.path.basename(path)))
+                    copied.append(os.path.basename(path))
+            except OSError as e:
+                src.Log.print_with_color(f"[Archive] metrics_raw not copied: {e}", "yellow")
+        else:
+            src.Log.print_with_color(
+                "[Archive] no metrics_raw_*.csv here — collect them from the edge/cloud "
+                "machines if you need per-batch message sizes", "yellow")
+
         # The config that produced these numbers, so the archive reads on its own
         # months later without having to guess the cut/batch/cluster settings.
         try:
@@ -1184,7 +1277,10 @@ class Server:
         # Per-cut estimated message size (MB), so the controller never moves the cut
         # to a point whose feature map would exceed the broker's max_message_size.
         try:
-            self._cut_sizes = get_cut_data_sizes(self.model_name, self.batch_size)
+            # Same wire-size scaling as the initial-cut cap, so the controller and
+            # the clustering guard can never disagree about which cuts are legal.
+            self._cut_sizes = self._wire_cut_sizes(
+                get_cut_data_sizes(self.model_name, self.batch_size))
         except Exception as e:
             src.Log.print_with_color(f"[Adaptive] cut-size table unavailable ({e}); size guard off", "yellow")
             self._cut_sizes = None
@@ -1382,6 +1478,7 @@ class Server:
                 [self.client_bandwidth_data.get(str(cid), network_rate)] * M
                 for cid in edge_clients
             ]) if edge_clients else np.full((N, M), network_rate)
+            self._audit_bandwidth(edge_clients, network_rate)
             cloud_clients = [cid for cid, lid in self.list_clients
                              if lid == len(self.total_clients) and str(cid) in self.client_profile_data]
             solver = DeterministicSimilarityAssignmentSolver(
@@ -1422,6 +1519,129 @@ class Server:
 
         return solver, result
 
+    def _audit_bandwidth(self, edge_clients, network_rate):
+        """Print every edge's measured egress rate plus the spread, and warn when
+        the spread says the measurements did not overlap.
+
+        Why this matters more than it looks: the solver treats edges as independent
+        parallel producers (Clustering.pair_metrics_for_cut sums 1/tau_i over
+        edges), so each rate must be that edge's own achievable SHARE, not the
+        link's total. That is what you get for free IF the co-located edges measure
+        simultaneously — contention is then already inside each sample and no
+        divisor belongs anywhere. It is NOT what you get if they measure one after
+        another: each one then sees an idle link, reports the full rate, and the
+        solver believes the cluster has N times the egress it really has, which
+        makes shallow cuts (big feature maps) look cheap.
+
+        Clients measure right after profiling, so a profile cache miss on some
+        machines is enough to stagger them. A tight spread is consistent with a
+        concurrent measurement; a wide one means the number is optimistic and the
+        chosen cut should not be trusted."""
+        rates = [self.client_bandwidth_data.get(str(cid)) for cid in edge_clients]
+        known = [r for r in rates if r is not None]
+        if not known:
+            src.Log.print_with_color(
+                f"[Bandwidth] no client measurements; using network_rate_mb_s="
+                f"{network_rate} MB/s for all edges", "yellow")
+            return
+        lo, hi = min(known), max(known)
+        src.Log.print_with_color(
+            f"[Bandwidth] {len(known)}/{len(rates)} edges measured: "
+            f"min={lo:.1f} median={float(np.median(known)):.1f} max={hi:.1f} MB/s "
+            f"(spread {hi / max(lo, 1e-9):.1f}x)", "cyan")
+        if hi / max(lo, 1e-9) > 3.0:
+            src.Log.print_with_color(
+                "[Bandwidth] WARNING spread > 3x across edges. The measurements "
+                "probably did NOT overlap, so the fast ones saw an idle link and "
+                "over-report their share. The solver sums per-edge rates, so it "
+                "will think this cluster has more egress than it does and may pick "
+                "a cut with a large feature map. For a trustworthy cut set "
+                "clustering.measure_bandwidth: False and pin network_rate_mb_s to "
+                "the per-edge share you actually observe.", "yellow")
+
+    def _cap_initial_cuts(self, best_cuts):
+        """Clamp each cluster's Hungarian cut to one whose feature map fits under
+        adaptive.max_message_mb.
+
+        The adaptive controller has always refused to MOVE to an oversized cut
+        (_nearest_safe_cut), but the cut clustering STARTS at went through no such
+        check — so with adaptive off, or before the first nudge, a cluster could sit
+        on a cut whose message is several times the broker's comfortable size for
+        the whole run. The size curve is not monotonic in the cut index (for
+        yolo26n@bs32 cut 4 is a local minimum, and cuts 3 and 5 are ~2.5x larger),
+        so 'shallower' is not a safe direction to guess: search outward from the
+        solver's choice and take the nearest cut that fits, preferring the smaller
+        message when both directions tie.
+
+        Returns the (possibly unchanged) array. Never raises: a missing size table
+        just means no cap, exactly as before."""
+        cap = float(self.adaptive_cfg.get("max_message_mb", 15.0))
+        try:
+            sizes = get_cut_data_sizes(self.model_name, self.batch_size)
+        except Exception as e:
+            src.Log.print_with_color(
+                f"[Clustering] cut-size table unavailable ({e}); initial-cut size cap off", "yellow")
+            return best_cuts
+        sizes = self._wire_cut_sizes(sizes)
+        n = len(sizes)
+
+        def est(cut):
+            """Wire size for a solver cut, or None when nothing is sent.
+
+            The solver's valid_cuts run -1..L-1, wider than the size table:
+              cut = -1    -> the edge runs no layers and ships the RAW input, which
+                             Clustering costs with input_data_size. At bs32 that is
+                             150MB float32 / 37.5MB at 8 bits — past the cap AND past
+                             RabbitMQ's 16MB default, i.e. a publish that fails at
+                             runtime. It must be capped, not skipped.
+              cut >= L-1  -> everything on the edge, net_time is 0, nothing to cap.
+            """
+            if cut < 0:
+                raw = float(get_raw_input_mb(self.batch_size))
+                return float(self._wire_cut_sizes(np.array([raw]))[0])
+            if cut >= n:
+                return None
+            return float(sizes[cut])
+
+        out = list(int(c) for c in best_cuts)
+        for k, cut in enumerate(out):
+            over = est(cut)
+            if over is None or over <= cap:
+                continue
+            # Nearest fitting cut by distance; ties go to the smaller message.
+            cands = [(abs(c - cut), float(sizes[c]), c) for c in range(n) if sizes[c] <= cap]
+            if not cands:
+                src.Log.print_with_color(
+                    f"[Clustering] WARNING cluster {k}: cut={cut} est ~{over:.1f}MB > cap "
+                    f"{cap}MB and NO cut fits. Raise RabbitMQ max_message_size and "
+                    f"adaptive.max_message_mb, or lower batch-size.", "red")
+                continue
+            _, newsz, newcut = min(cands)
+            src.Log.print_with_color(
+                f"[Clustering] cluster {k}: cut {cut} (~{over:.1f}MB) exceeds cap {cap}MB "
+                f"-> using cut {newcut} (~{newsz:.1f}MB)", "yellow")
+            out[k] = newcut
+        return np.array(out, dtype=int)
+
+    def _wire_cut_sizes(self, sizes):
+        """CUT_DATA_SIZES_MB scaled to what actually goes on the wire.
+
+        The table is the float32 tensor size, but the pipeline quantises to
+        compress.num_bit before publishing, so the real message is num_bit/32 of
+        the table (8-bit -> a quarter). Comparing an uncompressed estimate against
+        a broker limit that the compressed message has to satisfy overstates every
+        cut by 4x and pushes every decision toward deeper cuts.
+
+        NOTE this is still an upper bound: a measured run at cut=4 (bs32) put
+        1.65MB on the wire against a scaled estimate of ~2.97MB, so the table
+        itself is ~1.8x pessimistic. Re-measure with
+        `python tools/measure_cut_sizes.py --model <m> --batch_size <bs> --compress
+        --num_bit 8` to make it exact."""
+        if not self.compress.get("enable", False):
+            return np.asarray(sizes, dtype=float)
+        num_bit = int(self.compress.get("num_bit", 8))
+        return np.asarray(sizes, dtype=float) * (num_bit / 32.0)
+
     def notify_clients(self, start=True):
         if start:
             default_splits = {"a": 4, "b": 11, "c": 17, "d": 23}
@@ -1451,6 +1671,7 @@ class Server:
                         best_cuts    = h.best_cuts
                         K            = h.num_clusters
                         inv_matching = {int(matching[k]): k for k in range(K)}
+                        best_cuts    = self._cap_initial_cuts(best_cuts)
 
                         edge_ord  = [(cid, lid) for cid, lid in self.list_clients if lid == 1]
                         cloud_ord = [(cid, lid) for cid, lid in self.list_clients if lid == len(self.total_clients)]
@@ -1532,6 +1753,7 @@ class Server:
                     "multithreading": self.multithreading_cfg,
                     "backpressure": self.backpressure_cfg,
                     "detections": self.detections_cfg,
+                    "map":        self.map_cfg,
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 

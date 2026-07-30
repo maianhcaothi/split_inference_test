@@ -30,13 +30,40 @@ clustering:
   num_C: 3
   num_cloud: 3         # = clients[1] (tổng cloud)
   max_clusters: 3      # <= min(clients[0], clients[1])
-  network_rate_mb_s: 100.0
-  measure_bandwidth: True # True → đo thực tế mỗi lần chạy; False → dùng network_rate_mb_s cố định
+  network_rate_mb_s: 100.0  # MB/s egress MỖI edge (không phải tổng đường truyền!). Solver cộng
+                          # 1/tau của từng edge (Clustering.pair_metrics_for_cut) nên nó cần phần
+                          # băng thông riêng của mỗi edge. Với 9 edge chung 1 NIC, đặt ~ (tốc độ
+                          # đường truyền) / 9. KHÔNG có chỗ nào trong thuật toán chia cho số edge.
+  measure_bandwidth: True # True → mỗi client tự đo egress lúc đăng ký; False → dùng network_rate_mb_s.
+                          # Lưu ý: phép đo chỉ đúng khi 9 edge đo ĐỒNG THỜI (lúc đó contention đã
+                          # nằm trong số đo, và không cần chia thêm). Client đo ngay sau bước
+                          # profiling, nên nếu máy nào cache profile miss thì nó lệch pha và đo được
+                          # đường truyền rỗng → báo cao. Server in ra spread giữa các edge và cảnh
+                          # báo khi > 3x. Muốn cut TÁI LẬP ĐƯỢC giữa các run thì đặt False.
   profile_source: real     # auto → dùng real nếu có, không thì simulated; real → ép dùng real; simulated → ép dùng giả lập
 
 multithreading:
   enable: True            # chỉ hoạt động ở mode: split. Mỗi device chạy 2 luồng pipeline.
-  queue_size: 4           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device)
+  queue_size: 1           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device).
+                          # 1 = double-buffering, đủ để 2 luồng overlap. Đệm sâu hơn KHÔNG tăng
+                          # throughput (throughput bị chặn bởi phần cứng, không bởi độ sâu đệm) mà
+                          # chỉ cộng thêm latency: mỗi batch nằm chờ trong in_q + out_q. Ở
+                          # queue_size=4 đó là tới 8 batch x ~11.6s = ~93s, đúng bằng e2e p50 ~68s
+                          # đo được ở run 0730_0917. Đồng thời mỗi batch uint8 chiếm 39MB nên 4 ->
+                          # 1 giảm ~4x RAM đệm trên máy chạy 9 edge.
+
+performance:
+  # torch intra-op threads MỖI process.
+  #   auto = n_core / số process cùng vai trên máy đó (edge -> clients[0]=9,
+  #          cloud -> clients[1]=3). Đúng với topology hiện tại: 9 edge 1 máy,
+  #          3 cloud 1 máy.
+  #   0    = không can thiệp, để mặc định của torch (= n_core mỗi process).
+  #   N    = đặt cứng N threads.
+  # Vì sao cần: mặc định torch lấy n_core threads cho MỖI process, nên 9 edge
+  # process trên 1 máy 20 core sinh ra 180 luồng compute giành 20 core. Oversub
+  # kiểu này làm chậm tất cả mà không tăng throughput.
+  # Override cho từng máy: python client.py --layer_id 1 --threads 2
+  torch_threads: auto
 
 backpressure:
   enable: True            # edge dừng gửi khi intermediate_queue quá sâu → chống tràn RAM broker
@@ -44,8 +71,17 @@ backpressure:
 
 detections:
   save_json: True         # ghi detections.json khi kết thúc (đọc streaming từ jsonl → RAM phẳng). False = bỏ qua.
+                          # False cũng tắt luôn việc ghi detections_stream.jsonl trong lúc chạy
+                          # (1 lần open+write+close MỖI FRAME, nằm trong khoảng đo busy).
 
 map:                      # 2 pipeline mAP chạy ở Server lúc shutdown (ground truth = map/label/)
+  enable: True            # False = TẮT toàn bộ mAP per-batch trên device. Mỗi batch hiện phải trả:
+                          #   - 1 pass postprocess_yolo thứ hai ở conf=0.001 (ngưỡng này giữ gần như
+                          #     mọi anchor nên NMS của nó lớn hơn hẳn pass conf=0.25),
+                          #   - batch_size file map/pred/.../frame_NNNNNN.txt,
+                          #   - batch_size lần map_metric.update (torchmetrics).
+                          # Toàn bộ nằm TRONG khoảng get_input→output nên bị tính vào busy_s và e2e.
+                          # → Khi đo throughput/latency hãy đặt False. Đừng đo mAP và FPS cùng 1 run.
   window_batches: 16      # pipeline 1: cửa sổ trượt gồm N batch liên tiếp, dịch 1 batch mỗi bước → map_window.log
   collect_timeout_s: 30   # thời gian chờ tối đa để thu đủ zip map/pred/ từ các cloud/edge
 

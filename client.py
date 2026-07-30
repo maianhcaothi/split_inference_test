@@ -14,11 +14,45 @@ parser = argparse.ArgumentParser(description="Split learning framework")
 parser.add_argument('--layer_id', type=int, required=True, help='ID of layer, start from 1')
 parser.add_argument('--device', type=str, required=False, help='Device of client')
 parser.add_argument('--name', type=str, required=False, default=None, help='Name of this machine (e.g. machine-2, device-1)')
+parser.add_argument('--threads', type=int, required=False, default=None,
+                    help='torch intra-op threads for THIS process (overrides performance.torch_threads)')
 
 args = parser.parse_args()
 
 with open('config.yaml', 'r', encoding='utf-8') as file:
     config = yaml.safe_load(file)
+
+
+def _apply_torch_threads(cfg, layer_id, override):
+    """Cap this process's torch intra-op threads.
+
+    torch defaults to one thread per core PER PROCESS, which is right for one
+    process per machine and badly wrong here: 9 edge processes on one 20-core box
+    ask for 180 compute threads on 20 cores. The oversubscription slows every
+    process down without raising aggregate throughput.
+
+    'auto' divides the host's cores by the number of processes that share this
+    role, which matches the deployment (all edges on one machine, all clouds on
+    another). 0/None leaves torch untouched; an int sets it directly.
+    """
+    want = override if override is not None else cfg.get("performance", {}).get("torch_threads", 0)
+    if want in (None, 0, "0", False):
+        return
+    if isinstance(want, str) and want.strip().lower() == "auto":
+        clients = cfg["server"]["clients"]
+        # layer_id 1 == edge (clients[0]), anything else == cloud (clients[1]).
+        peers = clients[0] if layer_id == 1 else clients[1]
+        want = max(1, (os.cpu_count() or 1) // max(1, int(peers)))
+    try:
+        n = max(1, int(want))
+    except (TypeError, ValueError):
+        print(f"[Threads] ignoring invalid performance.torch_threads={want!r}")
+        return
+    torch.set_num_threads(n)
+    print(f"[Threads] torch intra-op threads = {n} (host has {os.cpu_count()} cores)")
+
+
+_apply_torch_threads(config, args.layer_id, args.threads)
 
 client_id = uuid.uuid4()
 address = config["rabbit"]["address"]

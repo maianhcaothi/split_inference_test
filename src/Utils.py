@@ -20,13 +20,24 @@ def delete_old_queues(address, username, password, virtual_host):
 
         for queue in queues:
             queue_name = queue['name']
-            if queue_name.startswith("reply") or queue_name.startswith("intermediate_queue") or queue_name.startswith(
-                    "result") or queue_name.startswith("rpc_queue") or queue_name.startswith("ctrl_"):
-
+            # DELETE, never purge. A purge empties a queue but leaves its
+            # consumers attached, so a server process left over from an earlier
+            # run keeps consuming 'fps_queue' / 'utilization_queue' /
+            # 'map_pred_queue' alongside the new one. RabbitMQ then round-robins
+            # the messages between them and every meter reads low by exactly the
+            # number of live servers (observed: DONEs split 4 ways, so
+            # fps_cluster.log reported a quarter of the real throughput).
+            # Deleting the queue cancels those consumers.
+            try:
                 http_channel.queue_delete(queue=queue_name)
-
-            else:
-                http_channel.queue_purge(queue=queue_name)
+            except Exception:
+                # A queue that vanished on its own (auto-delete, exclusive owner
+                # gone) closes the channel; reopen and keep going so one odd
+                # queue can't abort the whole cleanup.
+                try:
+                    http_channel = connection.channel()
+                except Exception:
+                    break
 
         connection.close()
         return True

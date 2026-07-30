@@ -100,6 +100,10 @@ class Scheduler:
         # RAM); detections.json is rebuilt from that file at the end. Keep only a
         # count in RAM, not every frame's boxes.
         self.save_detections_json = True
+        # Per-batch mAP work (2nd postprocess at conf=0.001, pred files,
+        # torchmetrics updates). Set from map.enable in inference_func; defaults on
+        # so nothing changes for callers that never pass the config.
+        self.map_on = True
         self._det_count = 0
         self._map_updated = False
         # 'map_pred_queue': whichever tier runs postprocess_yolo (last_layer/
@@ -117,24 +121,44 @@ class Scheduler:
         # cluster as well as system-wide. Raw samples, not pre-reduced stats:
         # percentiles cannot be pooled across devices after the fact, and a run's
         # worth of floats is a trivially small message.
-        self._lat_ms = []   # own-clock service latency (get input -> output)
+        # Pipeline latency: batch ready -> this device's output published. On the
+        # edge that INCLUDES the wait in the two hand-off queues, so it is not the
+        # device's service time — see _compute_utilization, which derives the true
+        # get_input -> output series from the timing markers instead.
+        self._lat_ms = []
         self._e2e_ms = []   # edge start -> this device's output (crosses devices)
+        # get_ram_mb is on the per-batch path; probe tegrastats once, not 56 times.
+        self._tegrastats_ok = None    # None = not probed, True/False = cached answer
+        self._psutil_proc = None
         self._load_gt_dict()
 
     def get_ram_mb(self):
-        try:
-            import subprocess, re
-            result = subprocess.run(
-                ['tegrastats', '--once'],
-                capture_output=True, text=True, timeout=2
-            )
-            m = re.search(r'RAM (\d+)/\d+MB', result.stdout)
-            if m:
-                return int(m.group(1))
-        except Exception:
-            pass
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / (1024 * 1024)
+        """Resident memory in MB, from tegrastats on Jetson and psutil elsewhere.
+
+        Called once per batch, so the tegrastats availability probe runs ONCE and
+        the answer is cached: on a non-Jetson host every call used to pay a failed
+        CreateProcess plus a PATH scan, and a 12-device run spent ~6000 process
+        spawns finding out the same thing over and over. The psutil handle is
+        cached for the same reason."""
+        if self._tegrastats_ok is not False:
+            try:
+                import subprocess, re
+                result = subprocess.run(
+                    ['tegrastats', '--once'],
+                    capture_output=True, text=True, timeout=2
+                )
+                m = re.search(r'RAM (\d+)/\d+MB', result.stdout)
+                if m:
+                    self._tegrastats_ok = True
+                    return int(m.group(1))
+            except Exception:
+                pass
+            # Either the binary is missing or its output didn't parse — both mean
+            # "don't try again", so every later call goes straight to psutil.
+            self._tegrastats_ok = False
+        if self._psutil_proc is None:
+            self._psutil_proc = psutil.Process(os.getpid())
+        return self._psutil_proc.memory_info().rss / (1024 * 1024)
 
     def _check_backpressure(self, max_queue):
         """Stall the caller while the intermediate queue is at/above max_queue, so
@@ -284,13 +308,19 @@ class Scheduler:
         covered by local ground truth — the video can run longer than the
         labelled subset (e.g. 1700 frames but GT only for the first 905), so
         mAP postprocessing for later batches would be pure waste."""
+        if not self.map_on:
+            return True
         if self._max_gt_frame is None:
             return False
         return batch_id * batch_size + 1 > self._max_gt_frame
 
     def _update_map(self, batch_results, batch_id, batch_size, map_results=None):
         import json
-        self._map_updated = True
+        # Only claim ownership of the mAP report when mAP work actually ran —
+        # otherwise the shutdown path would ship an empty map/pred/ zip and print
+        # a mAP summary over nothing.
+        if self.map_on:
+            self._map_updated = True
         # map_results uses conf≈0.001 so torchmetrics gets the full PR curve;
         # batch_results (conf=0.25) is only for the detection stream / display.
         _map = map_results if map_results is not None else batch_results
@@ -306,9 +336,16 @@ class Scheduler:
             ]
             # Stream to disk instead of holding every frame's boxes in RAM. RAM
             # stays flat over long videos; detections.json is rebuilt at the end.
-            self._det_count += 1
-            with open("detections_stream.jsonl", "a") as f:
-                f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
+            # Skipped entirely when nobody will read it: this is an open+write+close
+            # per FRAME (batch_size of them per batch) inside the timed window.
+            if self.save_detections_json:
+                self._det_count += 1
+                with open("detections_stream.jsonl", "a") as f:
+                    f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
+            if not self.map_on:
+                # map.enable=False: detections above still stream, but every mAP
+                # cost (pred file + torchmetrics update) is skipped.
+                continue
             if self._max_gt_frame is not None and frame_num > self._max_gt_frame:
                 # Past the labelled range: detections keep streaming above (for
                 # detections.json/tracker), but mAP stops here — no pred file,
@@ -466,6 +503,13 @@ class Scheduler:
         t_input = None
         busy_ns = 0
         n_packages = 0
+        # The individual busy intervals, i.e. the device's TRUE per-batch service
+        # latency. Summing them gives busy_ns, so this series and the utilization
+        # ratio can never disagree. It is reported separately from self._lat_ms,
+        # which measures batch-ready -> published and therefore also contains the
+        # hand-off queue waits (that is why the edge's number used to look ~7x
+        # worse than its actual per-batch compute).
+        svc_ms = []
         for ts, event in events:
             if event == "start":
                 t_start = ts
@@ -476,6 +520,7 @@ class Scheduler:
             elif event == "output":
                 if t_input is not None:
                     busy_ns += ts - t_input
+                    svc_ms.append((ts - t_input) / 1e6)
                     n_packages += 1
                     t_input = None
         if t_start is None or t_end is None or t_end <= t_start:
@@ -492,7 +537,8 @@ class Scheduler:
             # Which cluster this device belongs to, so the server can group both
             # utilization and latency per cluster instead of per device only.
             "cluster_id": self.intermediate_queue,
-            "lat_samples_ms": _cap_samples(self._lat_ms),
+            "svc_samples_ms": _cap_samples(svc_ms),      # get_input -> output
+            "lat_samples_ms": _cap_samples(self._lat_ms),  # batch ready -> published
             "e2e_samples_ms": _cap_samples(self._e2e_ms),
         }
         Log.print_with_color(
@@ -1090,7 +1136,14 @@ class Scheduler:
                         if not ret:
                             video_done = True
                         else:
-                            frame = cv2.resize(frame, (640, 640)).astype('float32') / 255.0
+                            # Stay uint8 here; _edge_infer_worker does .float()/255
+                            # after the H2D copy. Same arithmetic (an exact float32
+                            # division of the same integers, so the head model sees
+                            # bit-identical input and mAP is unchanged), but a
+                            # queued batch is 39MB instead of 157MB and the divide
+                            # runs on the inference device instead of stealing CPU
+                            # from the 9 edge processes sharing this host.
+                            frame = cv2.resize(frame, (640, 640))
                             frames.append(torch.from_numpy(frame).permute(2, 0, 1))
                             progressed = True
                     if len(frames) == batch_size:
@@ -1179,7 +1232,11 @@ class Scheduler:
                 # blocked in _mt_get above, i.e. waiting for an incoming batch.
                 self._mark_edge("get input")
                 batch_start, edge_start_wall, x_in = item
-                x_in = x_in.to(self.device)
+                # The capture thread hands over uint8 NCHW to keep the hand-off
+                # queues (and the H2D copy) 4x smaller; normalise here, on the
+                # inference device. float()/255.0 on the same integers is exactly
+                # what the old CPU-side astype('float32')/255.0 produced.
+                x_in = x_in.to(self.device).float().div_(255.0)
 
                 if self.adaptive_on:
                     cut = self.current_cut
@@ -1565,11 +1622,12 @@ class Scheduler:
                 pass
             method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None):
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None, map_cfg=None):
         adaptive = adaptive or {}
         multithreading = multithreading or {}
         backpressure = backpressure or {}
         detections = detections or {}
+        map_cfg = map_cfg or {}
         self.adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
         self.mt_on = bool(multithreading.get("enable", False)) and mode == "split"
         self.mt_queue_size = int(multithreading.get("queue_size", 4))
@@ -1578,6 +1636,19 @@ class Scheduler:
         self.backpressure_on = bool(backpressure.get("enable", False)) and mode == "split"
         self.backpressure_max = int(backpressure.get("max_queue", 20))
         self.save_detections_json = bool(detections.get("save_json", True))
+        # mAP work is measured OFF the hot path when disabled. Everything it costs
+        # per batch sits inside the get_input -> output window (_mark_*("output")
+        # is written after _update_map), so it is charged to this device's busy
+        # time and to e2e: a second full postprocess_yolo at conf=0.001 (which at
+        # that threshold keeps nearly every anchor, so its NMS dwarfs the conf=0.25
+        # pass), one pred .txt per frame, and one torchmetrics update per frame.
+        # Turn it off when the run is measuring throughput/latency — mAP and FPS
+        # should not be measured in the same run.
+        self.map_on = bool(map_cfg.get("enable", True))
+        if not self.map_on:
+            Log.print_with_color(
+                "[mAP] per-batch mAP OFF (no conf=0.001 pass, no pred files, no metric "
+                "updates). map.log/map_window.log will be empty for this run.", "yellow")
         if self.mt_on:
             Log.print_with_color(f"[Pipeline] multithreading ON (queue_size={self.mt_queue_size})", "cyan")
         if self.backpressure_on:

@@ -9,3 +9,8 @@ ultralytics==8.4.23
 scipy
 psutil
 tqdm
+torchmetrics
+# torchmetrics' MeanAveragePrecision needs a COCO eval backend, and it raises from
+# the CONSTRUCTOR (not the import) when one is absent. faster-coco-eval ships
+# wheels on Windows, so it needs no MSVC toolchain the way pycocotools can.
+faster-coco-eval

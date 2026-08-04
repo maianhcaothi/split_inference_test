@@ -181,7 +181,24 @@ class Scheduler:
     def _mark_cloud(self, event):
         self._timing_events_cloud.append((time.time_ns(), event))
 
-    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
+    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb,
+                      message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None,
+                      inference_ms=0.0, transfer_ms=0.0, decode_ms=0.0, wait_ms=0.0):
+        """One CSV row per batch.
+
+        inference_ms / transfer_ms / decode_ms / wait_ms are the per-stage split of
+        latency_ms. Every one of them was already being computed and then thrown
+        away (the only consumers were commented-out log lines), which is why
+        'where does the time go' could never be answered from an archived run —
+        the summary logs show that a pipeline is slow, never which stage is slow.
+
+          inference_ms  model forward on this device
+          transfer_ms   publish (edge): Encoder + pickle + basic_publish
+          decode_ms     pickle.loads + Decoder (cloud recv thread)
+          wait_ms       time the INFERENCE thread sat blocked waiting for input.
+                        Big wait_ms == this device is starved by the stage in
+                        front of it, and no amount of extra CPU here will help.
+        """
         file_path = f"metrics_raw_{self.intermediate_queue}_{str(self.client_id).replace('-', '')}.csv"
         file_exists = os.path.exists(file_path)
 
@@ -201,6 +218,10 @@ class Scheduler:
                     "message_size_bytes",
                     "e2e_latency_ms",
                     "edge_start_time",
+                    "inference_ms",
+                    "transfer_ms",
+                    "decode_ms",
+                    "wait_ms",
                 ])
 
             writer.writerow([
@@ -215,6 +236,10 @@ class Scheduler:
                 message_size_bytes,
                 round(e2e_latency_ms, 3),
                 edge_start_time if edge_start_time is not None else "",
+                round(inference_ms, 3),
+                round(transfer_ms, 3),
+                round(decode_ms, 3),
+                round(wait_ms, 3),
             ])
 
         # Same numbers the CSV row just recorded, kept in memory for this device's
@@ -1192,8 +1217,10 @@ class Scheduler:
         else:
             edge_best_cut = "N/A" if splits is None else splits
 
+        _bp = time.perf_counter()
         if self.backpressure_on:
             self._check_backpressure(self.backpressure_max)
+        bp_ms = (time.perf_counter() - _bp) * 1000
 
         payload["batch_id"] = batch_id
 
@@ -1213,17 +1240,24 @@ class Scheduler:
             batch_id=batch_id, batch_size=batch_size,
             latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
             message_size_bytes=msg_size, e2e_latency_ms=0.0,
-            edge_start_time=edge_start_wall)
-        # Log.print_with_color(
-        #     f"[Timing][edge-mt] infer={inference_ms:.1f}ms send={send_ms:.1f}ms "
-        #     f"latency={latency_ms:.1f}ms cut={edge_best_cut}", "magenta")
+            edge_start_time=edge_start_wall,
+            inference_ms=inference_ms,
+            # Everything the transfer thread does for this batch: the
+            # back-pressure stall plus Encoder + pickle + basic_publish.
+            transfer_ms=bp_ms + send_ms,
+            wait_ms=out.get("wait_ms", 0.0))
         pbar.update(batch_size)
 
     def _edge_infer_worker(self, model, in_q, out_q, width, height, splits, save_set):
         """Pure compute thread: batch (CPU) -> H2D -> head model -> D2H -> out_q."""
         try:
             while True:
+                # Time spent blocked here is this device being STARVED by the
+                # capture/transfer thread. Recorded per batch so a run can say
+                # whether the edge is compute-bound or input-bound.
+                _w = time.perf_counter()
                 item = self._mt_get(in_q)
+                wait_ms = (time.perf_counter() - _w) * 1000
                 if item is None:
                     break
                 # Utilization markers live on THIS thread: it is the only stage
@@ -1260,7 +1294,8 @@ class Scheduler:
                     payload["cut"] = int(cut)
 
                 out = {"batch_start": batch_start, "edge_start_wall": edge_start_wall,
-                       "inference_ms": inference_ms, "cut": cut, "payload": payload}
+                       "inference_ms": inference_ms, "cut": cut, "payload": payload,
+                       "wait_ms": wait_ms}
                 if not self._mt_put(out_q, out):
                     break
                 # Blocking on a full out_q (slow network) counts as busy —
@@ -1355,7 +1390,12 @@ class Scheduler:
         prev_done = None
         try:
             while True:
+                # Blocked here == starved by the recv thread (which is itself
+                # blocked downloading). This is the number that distinguishes
+                # "cloud is slow" from "cloud is waiting for bytes".
+                _w = time.perf_counter()
                 item = self._mt_get(local_q)
+                wait_ms = (time.perf_counter() - _w) * 1000
                 if item is None:
                     break
                 # Utilization markers live on THIS thread: it is the only stage
@@ -1406,10 +1446,13 @@ class Scheduler:
                     batch_id=batch_id, batch_size=batch_size,
                     latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
                     message_size_bytes=received_message_size,
-                    e2e_latency_ms=e2e_latency_ms, edge_start_time=edge_start_time)
-                # Log.print_with_color(
-                #     f"[Timing][cloud-mt] decode={decode_ms:.1f}ms infer+post={latency_ms:.1f}ms "
-                #     f"e2e={e2e_latency_ms:.1f}ms cut={cloud_best_cut}", "magenta")
+                    e2e_latency_ms=e2e_latency_ms, edge_start_time=edge_start_time,
+                    # latency_ms here is tail model + both postprocess passes.
+                    inference_ms=latency_ms,
+                    # Measured on the recv thread for THIS batch, so it is the
+                    # decode cost that had to finish before this batch could start.
+                    decode_ms=decode_ms,
+                    wait_ms=wait_ms)
 
                 # Hand this batch's fps 'done' ping to the recv thread to publish
                 # (the recv thread owns the pika channel; this thread must not).

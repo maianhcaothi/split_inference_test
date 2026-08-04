@@ -201,6 +201,12 @@ class Server:
         fps_cfg = config.get("fps", {})
         self._fps_grace_s = float(fps_cfg.get("grace_s", 10.0))
         self._fps_hardcap_s = float(fps_cfg.get("shutdown_timeout_s", 300))
+        # Watchdog: how long a started run may go without a single DONE before the
+        # server gives up. Guards the case _fps_hardcap_s cannot reach — an edge
+        # that never sends NOTIFY, which otherwise leaves this process consuming
+        # fps_queue for ever (see _idle_watchdog).
+        self._fps_idle_timeout_s = float(fps_cfg.get("idle_timeout_s", 600.0))
+        self._last_activity = time.time()
         self._fps_stop_bcast_t = None   # when all edges reported done
         self._fps_empty_since = None    # when work queues were first seen empty
         self._fps_work_queues = set()   # queues whose depth we watch while draining
@@ -407,6 +413,7 @@ class Server:
         fps."""
         t_ns = time.time_ns()
         t_s = t_ns / 1e9
+        self._last_activity = t_s      # feeds _idle_watchdog
         self._fps_times.append(t_s)
         n = len(self._fps_times)
         W = self._fps_window
@@ -459,6 +466,39 @@ class Server:
                 any_ok = True
                 total += depth
         return total if any_ok else None
+
+    def _idle_watchdog(self):
+        """Exit a run that has stopped making progress, instead of hanging forever.
+
+        THIS is why stale servers pile up. The normal shutdown path is only armed
+        inside the NOTIFY handler, and only once ALL edges have reported done
+        (see _fps_stop_bcast_t). If even one edge never gets there — you stop the
+        clients, a VM fails to open the video, a client crashes — then
+        _fps_drain_check is never scheduled, _fps_hardcap_s never applies (it is
+        gated on _fps_stop_bcast_t), and start_consuming() blocks for ever.
+
+        The abandoned server is invisible: the next run's delete_old_queues drops
+        rpc_queue so it stops seeing registrations and prints nothing. But it keeps
+        its fps_queue consumer, so it silently takes a share of every DONE from
+        then on. Four such servers is four abandoned runs, and every FPS number
+        divided by four.
+
+        So: if no DONE has arrived for idle_timeout_s while a run is in flight,
+        finish the run properly (summary + utilization + archive) and exit."""
+        if self._fps_printed:
+            return
+        idle = time.time() - self._last_activity
+        if idle >= self._fps_idle_timeout_s:
+            src.Log.print_with_color(
+                f"[Watchdog] no DONE for {idle:.0f}s (limit {self._fps_idle_timeout_s:.0f}s) — "
+                "a client died or was stopped. Finishing so this server does not "
+                "linger and steal DONEs from the next run.", "yellow")
+            self._finish_fps(f"idle {idle:.0f}s, run abandoned")
+            return
+        try:
+            self.connection.call_later(30.0, self._idle_watchdog)
+        except Exception:
+            pass
 
     def _fps_drain_check(self):
         """Periodic tail-watcher (scheduled once the edges finish). Keeps the fps
@@ -1114,7 +1154,12 @@ class Server:
         mode = self._get_mode()
         if mode != "split":
             return mode
-        return "dynamic" if self.adaptive_cfg.get("enable", False) else "split"
+        tag = "dynamic" if self.adaptive_cfg.get("enable", False) else "split"
+        # measure_mode goes in the directory name so an A/B pair can never be
+        # confused for two runs of the same configuration.
+        if self.config.get("clustering", {}).get("enable", False):
+            tag += f"_{self._measure_mode()}"
+        return tag
 
     def _archive_results(self):
         """Gather this run's result logs into results/results_<MMDD>_<HHMM>_<tag>/.
@@ -1140,6 +1185,7 @@ class Server:
             "utilization.log",
             "utilization_cluster.log",
             "cut_change_ns.log",
+            "clustering_input.json",
         )
         log_path = self.config["log-path"]
         base = os.path.join(log_path, "results",
@@ -1215,7 +1261,26 @@ class Server:
         self.reply_channel.basic_publish(exchange='', routing_key=reply_queue_name, body=message)
 
     def start(self):
-        self.channel.start_consuming()
+        try:
+            self.channel.start_consuming()
+        except Exception as e:
+            # The broker took our consumer away. In practice that means a NEWER
+            # server started and its delete_old_queues removed the queues this one
+            # was consuming — i.e. this process has been superseded.
+            #
+            # Exit WITHOUT writing results: log-path is shared, so finishing the
+            # shutdown pipeline here would overwrite the new run's logs with this
+            # abandoned run's numbers. Quitting is the whole point — a server that
+            # lingers is what splits the DONE stream in the first place.
+            src.Log.print_with_color(
+                f"[Server] consumer cancelled by the broker ({type(e).__name__}: {e}).\n"
+                "         A newer server has taken over this broker. Exiting without "
+                "writing results so the new run's logs stay intact.", "yellow")
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            sys.exit(0)
         # start_consuming returns once _finish_fps stopped the consumer (FPS
         # drain + summary done) — now gather every device's utilization report
         # before closing the connection.
@@ -1474,11 +1539,12 @@ class Server:
             M = len(cloud_times_list)
             edge_clients = [cid for cid, lid in self.list_clients
                             if lid == 1 and str(cid) in self.client_profile_data]
+            share = self._egress_share(len(edge_clients))
             rates_matrix = np.array([
-                [self.client_bandwidth_data.get(str(cid), network_rate)] * M
+                [self._edge_rate(cid, network_rate, share)] * M
                 for cid in edge_clients
             ]) if edge_clients else np.full((N, M), network_rate)
-            self._audit_bandwidth(edge_clients, network_rate)
+            self._audit_bandwidth(edge_clients, network_rate, share)
             cloud_clients = [cid for cid, lid in self.list_clients
                              if lid == len(self.total_clients) and str(cid) in self.client_profile_data]
             solver = DeterministicSimilarityAssignmentSolver(
@@ -1496,6 +1562,9 @@ class Server:
                 self.client_name_data.get(str(cid), f"cloud_{str(cid)[:8]}")
                 for cid in cloud_clients
             ]
+            self._dump_clustering_input(
+                edge_clients, cloud_clients, edge_times_list, cloud_times_list,
+                rates_matrix, solver, max_clusters, network_rate, share)
             result = solver.solve_best_over_k("hungarian", max_clusters=max_clusters)["best_result"]
             print_result(result, solver, title="HUNGARIAN MATCHING RESULT (real profiles)")
         else:
@@ -1519,7 +1588,113 @@ class Server:
 
         return solver, result
 
-    def _audit_bandwidth(self, edge_clients, network_rate):
+    def _dump_clustering_input(self, edge_clients, cloud_clients, edge_times, cloud_times,
+                               rates_matrix, solver, max_clusters, network_rate, share):
+        """Write every number the Hungarian solver was given to clustering_input.json.
+
+        Until now the solver's input vanished the moment the run ended: the console
+        printed only the ANSWER (K, best_cuts, throughput), so 'why did K drop from
+        2 to 1' could only be guessed at. Everything here is small and json-safe, so
+        tools/replay_clustering.py can re-run the solver offline and sweep the
+        network rate to show how sensitive the answer is to the one input we know
+        is uncertain.
+
+        Written next to the other logs and archived with them. Never fatal."""
+        import json
+        path = os.path.join(self.config["log-path"], "clustering_input.json")
+        try:
+            payload = {
+                "written_ns": time.time_ns(),
+                "measure_mode": self._measure_mode(),
+                "model_name": self.model_name,
+                "batch_size": self.batch_size,
+                "max_clusters": int(max_clusters),
+                "network_rate_mb_s": float(network_rate),
+                "egress_share": int(share),
+                "compress": dict(self.compress or {}),
+                "edges": [
+                    {
+                        "client_id": str(cid),
+                        "name": self.client_name_data.get(str(cid)),
+                        "layer_times_s": [float(v) for v in edge_times[i]],
+                        "measured_mb_s": self.client_bandwidth_data.get(str(cid)),
+                        "rate_used_mb_s": float(rates_matrix[i][0]),
+                    }
+                    for i, cid in enumerate(edge_clients)
+                ],
+                "clouds": [
+                    {
+                        "client_id": str(cid),
+                        "name": self.client_name_data.get(str(cid)),
+                        "layer_times_s": [float(v) for v in cloud_times[j]],
+                    }
+                    for j, cid in enumerate(cloud_clients)
+                ],
+                "cut_data_sizes_mb": [float(v) for v in solver.cut_data_sizes],
+                "input_data_size_mb": float(solver.input_data_size),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            src.Log.print_with_color(f"[Clustering] solver input -> {path}", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(f"[Clustering] could not dump solver input: {e}", "yellow")
+
+    def _measure_mode(self):
+        """'legacy' reproduces the July measurement chain end to end; 'new' uses
+        the reworked one. Only the things that CHANGE THE RESULT are switched:
+        the bandwidth probe, the per-edge egress divisor, the compression-aware
+        cut-size estimate and the initial-cut size cap.
+
+        Deliberately NOT switched: the single-server guard, the queue deletion in
+        delete_old_queues and the idle watchdog. Those fix a measurement CORRUPTION
+        (several servers splitting the DONE stream, so every FPS reads low by the
+        number of live servers). Putting them behind this switch would mean the
+        legacy arm reports a quarter of its real throughput and the comparison
+        would measure the bug rather than the algorithm."""
+        return str(self.config.get("clustering", {})
+                   .get("measure_mode", "new")).strip().lower()
+
+    def _egress_share(self, n_edges):
+        """How many edges share one uplink, i.e. what to divide a MEASURED rate by.
+
+        The solver models edges as independent parallel producers: it sums 1/tau_i
+        across them (Clustering.pair_metrics_for_cut), so network_rates[i] must be
+        the share edge i can actually sustain WHILE THE OTHERS ARE SENDING.
+
+        A client measures alone, on an idle link, and therefore reports the full
+        link rate — always, not occasionally. The measurements cannot overlap:
+        overlapping needs every client to start within ~0.2s of each other, and
+        they arrive at measure_bandwidth after torch.load + profiling, which finish
+        seconds to minutes apart on differently-sized VMs. So the sum of N measured
+        rates over-states the cluster's real egress by ~N and the solver picks cuts
+        with feature maps the link cannot carry.
+
+        auto = number of edges (all edge VMs share one host NIC here). Set 1 when
+        every edge genuinely has its own uplink. A hand-set network_rate_mb_s is
+        NOT divided — that value is documented as already being the per-edge share.
+        """
+        if self._measure_mode() == "legacy":
+            return 1          # July behaviour: measured rates fed in undivided
+        cfg = self.config.get("clustering", {})
+        want = cfg.get("egress_share", "auto")
+        if isinstance(want, str) and want.strip().lower() == "auto":
+            return max(1, int(n_edges))
+        try:
+            return max(1, int(want))
+        except (TypeError, ValueError):
+            src.Log.print_with_color(
+                f"[Bandwidth] invalid clustering.egress_share={want!r}, using 1", "yellow")
+            return 1
+
+    def _edge_rate(self, cid, network_rate, share):
+        """This edge's per-edge egress for the solver: measured/share, or the
+        configured network_rate_mb_s (already per-edge) when it never measured."""
+        measured = self.client_bandwidth_data.get(str(cid))
+        if measured is None:
+            return float(network_rate)
+        return float(measured) / share
+
+    def _audit_bandwidth(self, edge_clients, network_rate, share=1):
         """Print every edge's measured egress rate plus the spread, and warn when
         the spread says the measurements did not overlap.
 
@@ -1546,18 +1721,27 @@ class Server:
             return
         lo, hi = min(known), max(known)
         src.Log.print_with_color(
-            f"[Bandwidth] {len(known)}/{len(rates)} edges measured: "
+            f"[Bandwidth] {len(known)}/{len(rates)} edges measured (solo, idle link): "
             f"min={lo:.1f} median={float(np.median(known)):.1f} max={hi:.1f} MB/s "
             f"(spread {hi / max(lo, 1e-9):.1f}x)", "cyan")
+        if share > 1:
+            src.Log.print_with_color(
+                f"[Bandwidth] divided by egress_share={share} -> per-edge "
+                f"{float(np.median(known)) / share:.2f} MB/s fed to the solver "
+                f"(aggregate {float(np.median(known)):.1f} MB/s for the group)", "cyan")
+        else:
+            src.Log.print_with_color(
+                "[Bandwidth] egress_share=1: each measured rate is passed to the "
+                "solver unchanged, and the solver SUMS them. Only correct if every "
+                "edge really has its own uplink — otherwise set clustering."
+                "egress_share: auto.", "yellow")
         if hi / max(lo, 1e-9) > 3.0:
             src.Log.print_with_color(
-                "[Bandwidth] WARNING spread > 3x across edges. The measurements "
-                "probably did NOT overlap, so the fast ones saw an idle link and "
-                "over-report their share. The solver sums per-edge rates, so it "
-                "will think this cluster has more egress than it does and may pick "
-                "a cut with a large feature map. For a trustworthy cut set "
-                "clustering.measure_bandwidth: False and pin network_rate_mb_s to "
-                "the per-edge share you actually observe.", "yellow")
+                "[Bandwidth] WARNING spread > 3x across edges — the per-edge numbers "
+                "differ far more than one shared link should produce. Suspect a "
+                "straggler VM or a busy host during measurement; the resulting cut "
+                "should not be trusted. Pin network_rate_mb_s with "
+                "measure_bandwidth: False for a reproducible cut.", "yellow")
 
     def _cap_initial_cuts(self, best_cuts):
         """Clamp each cluster's Hungarian cut to one whose feature map fits under
@@ -1575,6 +1759,11 @@ class Server:
 
         Returns the (possibly unchanged) array. Never raises: a missing size table
         just means no cap, exactly as before."""
+        if self._measure_mode() == "legacy":
+            src.Log.print_with_color(
+                "[Clustering] measure_mode=legacy -> initial-cut size cap OFF "
+                "(July behaviour: the solver's cut was used as-is)", "yellow")
+            return best_cuts
         cap = float(self.adaptive_cfg.get("max_message_mb", 15.0))
         try:
             sizes = get_cut_data_sizes(self.model_name, self.batch_size)
@@ -1637,6 +1826,8 @@ class Server:
         itself is ~1.8x pessimistic. Re-measure with
         `python tools/measure_cut_sizes.py --model <m> --batch_size <bs> --compress
         --num_bit 8` to make it exact."""
+        if self._measure_mode() == "legacy":
+            return np.asarray(sizes, dtype=float)   # July: raw float32 table
         if not self.compress.get("enable", False):
             return np.asarray(sizes, dtype=float)
         num_bit = int(self.compress.get("num_bit", 8))
@@ -1760,6 +1951,11 @@ class Server:
             # t0 for SYSTEM FPS (frames / (START -> last DONE)) — captured right
             # after the START fan-out, so warm-up is included in the whole-run rate.
             self._fps_start_t = time.time()
+            self._last_activity = time.time()
+            try:
+                self.connection.call_later(30.0, self._idle_watchdog)
+            except Exception:
+                pass
 
             self._start_adaptive_controller()
         else:

@@ -30,40 +30,106 @@ clustering:
   num_C: 3
   num_cloud: 3         # = clients[1] (tổng cloud)
   max_clusters: 3      # <= min(clients[0], clients[1])
-  network_rate_mb_s: 100.0  # MB/s egress MỖI edge (không phải tổng đường truyền!). Solver cộng
+  network_rate_mb_s: 13.0 # MB/s egress MỖI edge (KHÔNG phải tổng đường truyền!). Solver cộng
                           # 1/tau của từng edge (Clustering.pair_metrics_for_cut) nên nó cần phần
-                          # băng thông riêng của mỗi edge. Với 9 edge chung 1 NIC, đặt ~ (tốc độ
-                          # đường truyền) / 9. KHÔNG có chỗ nào trong thuật toán chia cho số edge.
-  measure_bandwidth: True # True → mỗi client tự đo egress lúc đăng ký; False → dùng network_rate_mb_s.
-                          # Lưu ý: phép đo chỉ đúng khi 9 edge đo ĐỒNG THỜI (lúc đó contention đã
-                          # nằm trong số đo, và không cần chia thêm). Client đo ngay sau bước
-                          # profiling, nên nếu máy nào cache profile miss thì nó lệch pha và đo được
-                          # đường truyền rỗng → báo cao. Server in ra spread giữa các edge và cảnh
-                          # báo khi > 3x. Muốn cut TÁI LẬP ĐƯỢC giữa các run thì đặt False.
+                          # băng thông riêng của mỗi edge.
+                          # 13.0 = GIẢ ĐỊNH host NIC 1 Gbps (~125 MB/s) chia cho 9 edge. HÃY KIỂM
+                          # CHỨNG: đo tốc độ thật giữa 1 VM edge và máy broker (iperf3, hoặc copy
+                          # một file lớn), rồi chia cho số edge. Giá trị cũ 100.0 tương đương
+                          # 900 MB/s tổng (~7 Gbps) — gần như chắc chắn quá lạc quan, và rate quá
+                          # cao làm solver tưởng truyền dữ liệu miễn phí → chọn cut sâu, feature
+                          # map to → NIC thành nút cổ chai.
+                          # Dùng tools/replay_clustering.py để xem K và cut đổi thế nào theo rate.
+  # ─── CHỌN CÁCH ĐO: legacy (code tháng 7) hay new ─────────────────────────
+  measure_mode: new       # legacy | new   — chỉ đổi những thứ LÀM ĐỔI KẾT QUẢ:
+                          #
+                          #  legacy = đúng chuỗi đo của tháng 7 (đã cho 32 fps):
+                          #     · đo băng thông: 1 MB qua rpc_queue → server → reply_queue,
+                          #       chờ ACK bằng vòng poll 5 ms (gồm cả thời gian server đáp)
+                          #     · KHÔNG chia egress_share
+                          #     · cut_data_sizes để nguyên float32 (không scale theo num_bit)
+                          #     · KHÔNG cap kích thước bản tin cho cut khởi tạo
+                          #
+                          #  new = chuỗi đo đã sửa:
+                          #     · đo băng thông: publish thẳng 4 MB vào queue riêng (đúng
+                          #       đường mà run thật dùng), không qua server, không poll
+                          #     · chia cho egress_share
+                          #     · scale cut_data_sizes theo compress.num_bit
+                          #     · cap kích thước bản tin cho cut khởi tạo
+                          #
+                          # KHÔNG nằm trong công tắc này (luôn bật): guard một-server-duy-nhất,
+                          # xoá queue trong delete_old_queues, idle watchdog. Đó là các bản vá
+                          # chống HỎNG PHÉP ĐO (nhiều server chia nhau luồng DONE làm FPS bị
+                          # chia). Nếu tắt chúng ở nhánh legacy thì nhánh đó sẽ báo FPS thấp
+                          # hơn thực 4 lần, và bạn sẽ so sánh cái bug chứ không so thuật toán.
+                          #
+                          # Tên thư mục kết quả tự động kèm mode: results_MMDD_HHMM_split_legacy
+                          # / _split_new, nên hai lần chạy không bao giờ lẫn.
+  bandwidth_payload_mb:   # để trống = mặc định theo mode (legacy 1.0 / new 4.0)
+  bandwidth_runs:         # để trống = mặc định theo mode (legacy 3 / new 5)
+
+  measure_bandwidth: False # True → mỗi client tự đo egress lúc đăng ký; False → dùng network_rate_mb_s.
+                          # ĐANG ĐỂ False có chủ đích: phép đo luôn diễn ra khi đường truyền RỖNG
+                          # (client đo ngay sau torch.load + profiling, mà hai bước đó kết thúc lệch
+                          # nhau vài giây tới vài phút giữa các VM — trong khi để các phép đo đè lên
+                          # nhau thì cần lệch < 0.2s). Nên nó luôn báo về tốc độ full-link chứ không
+                          # phải phần chia. egress_share ở dưới bù lại điều đó, nhưng pin cứng
+                          # network_rate_mb_s vẫn là cách duy nhất để cut TÁI LẬP ĐƯỢC giữa các run.
+  egress_share: auto      # chia tốc độ ĐO ĐƯỢC cho bao nhiêu edge dùng chung một uplink.
+                          #   auto = số edge (topology hiện tại: 9 VM edge chung 1 NIC của host)
+                          #   1    = mỗi edge có uplink riêng thật sự
+                          # Vì sao cần: solver cộng 1/tau của từng edge (coi chúng là producer song
+                          # song độc lập), nên nếu đưa vào 9 giá trị full-link thì nó tưởng cụm có
+                          # 9x egress → chọn cut nông/feature map to → NIC thành nút cổ chai.
+                          # KHÔNG áp dụng cho network_rate_mb_s (giá trị đó bạn đã tự đặt per-edge).
   profile_source: real     # auto → dùng real nếu có, không thì simulated; real → ép dùng real; simulated → ép dùng giả lập
 
 multithreading:
   enable: True            # chỉ hoạt động ở mode: split. Mỗi device chạy 2 luồng pipeline.
-  queue_size: 1           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device).
-                          # 1 = double-buffering, đủ để 2 luồng overlap. Đệm sâu hơn KHÔNG tăng
-                          # throughput (throughput bị chặn bởi phần cứng, không bởi độ sâu đệm) mà
-                          # chỉ cộng thêm latency: mỗi batch nằm chờ trong in_q + out_q. Ở
-                          # queue_size=4 đó là tới 8 batch x ~11.6s = ~93s, đúng bằng e2e p50 ~68s
-                          # đo được ở run 0730_0917. Đồng thời mỗi batch uint8 chiếm 39MB nên 4 ->
-                          # 1 giảm ~4x RAM đệm trên máy chạy 9 edge.
+  queue_size: 4           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device).
+                          # ĐÁNH ĐỔI THROUGHPUT <-> LATENCY, và với hệ này throughput thắng:
+                          #   - Thí nghiệm scaling (9 / 6 / 3 máy) cho thấy FPS tỉ lệ THUẬN với số
+                          #     máy => không có tài nguyên chung nào bão hoà. Mỗi pipeline bị chặn
+                          #     bởi ĐỘ TRỄ, không bởi băng thông.
+                          #   - Pipeline bị chặn bởi độ trễ thì đệm sâu là thứ hấp thụ jitter và cho
+                          #     các tầng chạy vượt lên nhau. queue_size=1 làm luồng infer đói ngay
+                          #     khi tầng trước trễ một nhịp.
+                          # Cái giá: mỗi batch nằm chờ trong in_q + out_q nên e2e latency tăng theo
+                          # độ sâu. Nếu bạn tối ưu LATENCY thay vì FPS thì hạ về 1.
+                          # Nên quét 1 / 4 / 8 và xem đường cong FPS trước khi chốt.
 
 performance:
   # torch intra-op threads MỖI process.
-  #   auto = n_core / số process cùng vai trên máy đó (edge -> clients[0]=9,
-  #          cloud -> clients[1]=3). Đúng với topology hiện tại: 9 edge 1 máy,
-  #          3 cloud 1 máy.
-  #   0    = không can thiệp, để mặc định của torch (= n_core mỗi process).
+  #   0    = không can thiệp (ĐÚNG khi mỗi device là 1 VM/1 máy riêng — lúc đó
+  #          os.cpu_count() đã chính là vCPU của riêng VM, torch tự giới hạn đúng).
   #   N    = đặt cứng N threads.
-  # Vì sao cần: mặc định torch lấy n_core threads cho MỖI process, nên 9 edge
-  # process trên 1 máy 20 core sinh ra 180 luồng compute giành 20 core. Oversub
-  # kiểu này làm chậm tất cả mà không tăng throughput.
-  # Override cho từng máy: python client.py --layer_id 1 --threads 2
-  torch_threads: auto
+  #   auto = n_core / procs_per_host  (chỉ dùng khi NHIỀU device process
+  #          dùng CHUNG một OS).
+  torch_threads: 0
+
+  # Số device process dùng chung MỘT OS. Chỉ có ý nghĩa với torch_threads: auto.
+  #   1 = mỗi device 1 VM/1 máy riêng (topology hiện tại) → auto không chia gì.
+  #   9 = 9 process edge trong cùng 1 OS → auto = n_core/9.
+  procs_per_host: 1
+
+  # LƯU Ý cho VM trên host bị oversubscribe (topology hiện tại: 9 VM edge +
+  # 3 VM cloud trên cùng host): VM nhiều vCPU có thể CHẬM HƠN VM ít vCPU.
+  #   - VM 4 vCPU cần 4 core vật lý rảnh CÙNG LÚC mới chạy được vùng song song
+  #     (co-scheduling), nên bị xếp hàng chờ nhiều hơn VM 1 vCPU;
+  #   - torch mở 4 luồng, và khi hypervisor rút 1 vCPU đi giữa vùng song song thì
+  #     3 luồng còn lại busy-spin ở fork-join barrier, đốt quota của chính VM.
+  # Nếu thấy VM nhiều vCPU chậm hơn, thử trên đúng VM đó:
+  #     python client.py --layer_id 1 --threads 1
+  # và/hoặc đặt biến môi trường OMP_WAIT_POLICY=passive để barrier ngủ thay vì spin.
+
+fps:
+  idle_timeout_s: 600     # run đã START mà không có DONE nào trong ngần này giây → server tự kết
+                          # thúc (in summary, thu utilization, archive) rồi thoát.
+                          # Vì sao cần: đường tắt máy bình thường chỉ được kích hoạt khi ĐỦ CẢ 9
+                          # edge gửi NOTIFY. Chỉ cần 1 edge không tới đích (bạn dừng client, VM lỗi
+                          # mở video, client crash) là server treo trong start_consuming() VĨNH VIỄN
+                          # — và nó vẫn giữ consumer trên fps_queue, âm thầm ăn bớt DONE của mọi run
+                          # sau đó. 4 server sót = 4 lần chạy dở.
 
 backpressure:
   enable: True            # edge dừng gửi khi intermediate_queue quá sâu → chống tràn RAM broker

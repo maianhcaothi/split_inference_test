@@ -1,0 +1,4 @@
+1785376021348746920 cluster=intermediate_queue_0 fps=4.128 steady_fps=4.136 done=17 frames=544 share=43.6%
+1785376021348746920 cluster=intermediate_queue_1 fps=0.966 steady_fps=1.023 done=11 frames=352 share=28.2%
+1785376021348746920 cluster=intermediate_queue_2 fps=0.661 steady_fps=0.660 done=11 frames=352 share=28.2%
+1785376021348746920 SYSTEM fps=2.344 done=39 frames=1248 clusters=3

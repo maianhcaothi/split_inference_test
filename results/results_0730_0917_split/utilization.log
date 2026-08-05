@@ -1,0 +1,12 @@
+1785377718882747020 client=65cda997-028b-4b67-b831-c8ff8654e701 role=edge packages=56 busy_s=260.836 total_s=571.827 utilization=45.61%
+1785377718883540323 client=01c283e9-b4b5-4eb4-b730-6ea4f9edbb2e role=edge packages=56 busy_s=262.617 total_s=603.064 utilization=43.55%
+1785377718884217696 client=fca5e292-4021-4008-8ab2-367026386440 role=edge packages=56 busy_s=269.347 total_s=642.906 utilization=41.90%
+1785377718885846002 client=764a98f7-cd86-4617-ac34-818537301180 role=edge packages=56 busy_s=645.185 total_s=646.530 utilization=99.79%
+1785377718886492377 client=79cec8de-7ddf-42e9-b315-e0152235262d role=edge packages=56 busy_s=647.121 total_s=648.910 utilization=99.72%
+1785377718887109221 client=00da4629-f511-4000-8363-20c7e479746a role=edge packages=56 busy_s=650.849 total_s=652.504 utilization=99.75%
+1785377718887650232 client=b4936a66-11f8-4cb1-b903-8396e254d046 role=edge packages=56 busy_s=422.599 total_s=697.282 utilization=60.61%
+1785377718888174471 client=470fa0da-33a8-4343-a4b8-8e6594343126 role=edge packages=56 busy_s=417.014 total_s=701.770 utilization=59.42%
+1785377718888838361 client=0f134915-b456-4715-a247-75383b8df228 role=edge packages=56 busy_s=427.054 total_s=711.692 utilization=60.01%
+1785377718889455767 client=24299b7d-649e-48f9-adbe-758044bcf0fd role=cloud packages=168 busy_s=470.002 total_s=709.408 utilization=66.25%
+1785377718890096577 client=376821bb-5e55-425b-98af-56e6388629e8 role=cloud packages=171 busy_s=396.408 total_s=728.491 utilization=54.41%
+1785377718891096483 client=25ebd865-e602-4f82-8823-16469cd96627 role=cloud packages=165 busy_s=414.852 total_s=729.443 utilization=56.87%

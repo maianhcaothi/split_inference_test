@@ -1,0 +1,8 @@
+1785376081616213784 cluster=intermediate_queue_0 WINDOW mAP50_95=0.1009 mAP50=0.1871 (mean of 14 window(s) x 16 batches, step 1)
+1785376081616213784 cluster=intermediate_queue_0 ALL mAP50_95=0.0883 mAP50=0.1640 (905/905 GT frame(s) matched)
+1785376081616213784 cluster=intermediate_queue_1 WINDOW mAP50_95=0.1007 mAP50=0.1865 (mean of 14 window(s) x 16 batches, step 1)
+1785376081616213784 cluster=intermediate_queue_1 ALL mAP50_95=0.0883 mAP50=0.1638 (905/905 GT frame(s) matched)
+1785376081616213784 cluster=intermediate_queue_2 WINDOW mAP50_95=0.1008 mAP50=0.1862 (mean of 14 window(s) x 16 batches, step 1)
+1785376081616213784 cluster=intermediate_queue_2 ALL mAP50_95=0.0882 mAP50=0.1630 (905/905 GT frame(s) matched)
+1785376081616213784 OVERALL WINDOW mAP50_95=0.1008 mAP50=0.1866 (avg over 3 cluster(s))
+1785376081616213784 OVERALL ALL mAP50_95=0.0883 mAP50=0.1636 (avg over 3 cluster(s))

@@ -182,3 +182,19 @@ metrics_pivoted.csv
 metrics_pivot.lock
 *.npy
 app.log
+
+# Media, model weights, and ground-truth dataset (kept out of git history)
+*.mp4
+*.pt
+map/
+
+# IDE
+.idea/
+
+# Run artifacts
+detections.json
+detections_stream.jsonl
+metrics_pivoted_*.csv
+
+# ...but archived run results ARE the deliverable (the *.log rule above would eat them)
+!results/**/*.log

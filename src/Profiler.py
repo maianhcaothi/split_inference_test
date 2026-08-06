@@ -11,20 +11,12 @@ def profile_or_load(model_name: str, model, device: str,
     """
     Profile per-layer inference time of model on device.
     Returns np.array of shape (n_layers,) — mean seconds per layer per batch.
-    Cache saved as profile_{model_name}_{device}_bs{batch_size}[_fp32].npy next to
-    client.py.
-
-    The _fp32 suffix appears ONLY for CUDA devices. That is where the measurement
-    semantics actually changed: the old code profiled in half() while the pipeline
-    runs float(), so a CUDA cache from before must not be reused. On CPU the old
-    code never called half() (is_cuda was False), so an existing CPU cache is still
-    valid and keeps its name — renaming it would have forced every CPU device to
-    re-profile for no reason, and re-profiling changes the numbers the solver
-    clusters on, which is exactly the confound you don't want mid-comparison.
+    Cache saved as profile_{model_name}_{device}_bs{batch_size}_fp32.npy next to
+    client.py. The dtype is in the name on purpose: older caches were measured in
+    half() while the pipeline runs float(), so they must not be reused — the new
+    name makes them invisible instead of silently wrong.
     """
-    _cuda_cache = (device != "cpu")
-    suffix = "_fp32" if _cuda_cache else ""
-    cache_path = f"profile_{model_name}_{device}_bs{batch_size}{suffix}.npy"
+    cache_path = f"profile_{model_name}_{device}_bs{batch_size}_fp32.npy"
 
     if os.path.exists(cache_path):
         times = np.load(cache_path)
@@ -114,83 +106,8 @@ def profile_or_load(model_name: str, model, device: str,
 
 
 def measure_bandwidth(channel, client_id: str,
-                      payload_size_mb: float = None,
-                      runs: int = None,
-                      mode: str = "new") -> float:
-    """Dispatch to the legacy or the new probe (clustering.measure_mode).
-
-    Two probes are kept side by side ON PURPOSE so a run can be reproduced with
-    either, and the two compared. They measure different things and therefore
-    return different numbers — that difference is the whole point of the A/B:
-
-      legacy — 1MB through rpc_queue -> server -> reply_queue, waiting for an ACK
-               with a 5ms polling loop. Includes the server's response time and
-               quantises every sample to 5ms. This is what produced the cuts used
-               by the July runs.
-      new    — 4MB published straight into a throwaway queue on this device's own
-               channel: the same path the run itself uses, no server in the middle,
-               no polling quantisation.
-
-    payload_size_mb / runs default per mode when left as None, and can be pinned
-    from config to re-measure with different settings.
-    """
-    if str(mode).strip().lower() == "legacy":
-        return _measure_bandwidth_legacy(
-            channel, client_id,
-            1.0 if payload_size_mb is None else payload_size_mb,
-            3 if runs is None else runs)
-    return _measure_bandwidth_direct(
-        channel, client_id,
-        4.0 if payload_size_mb is None else payload_size_mb,
-        5 if runs is None else runs)
-
-
-def _measure_bandwidth_legacy(channel, client_id: str,
-                              payload_size_mb: float = 1.0,
-                              runs: int = 3) -> float:
-    """The July probe, kept verbatim so old results stay reproducible.
-
-    Round trip: publish to 'rpc_queue' -> server replies BW_ACK on reply_<id> ->
-    poll for it every 5ms. The measured time therefore includes the server's
-    turnaround, and is quantised to the 5ms poll. Both effects push the estimate
-    DOWN, which made the solver treat big feature maps as expensive and pick
-    shallower cuts.
-    """
-    reply_queue = f"reply_{client_id}"
-    channel.queue_declare(reply_queue, durable=False)
-    payload = os.urandom(int(payload_size_mb * 1024 * 1024))
-
-    timeout_s = 30.0
-    samples = []
-    for _ in range(runs):
-        message = pickle.dumps({
-            "action": "BW_TEST",
-            "client_id": client_id,
-            "payload": payload,
-        })
-        t_start = time.perf_counter()
-        channel.basic_publish(exchange='', routing_key='rpc_queue', body=message)
-        while True:
-            _, _, body = channel.basic_get(queue=reply_queue, auto_ack=True)
-            if body:
-                break
-            if time.perf_counter() - t_start > timeout_s:
-                raise TimeoutError(
-                    f"Bandwidth measurement timed out after {timeout_s}s (server not responding)")
-            time.sleep(0.005)
-        samples.append(payload_size_mb / max(time.perf_counter() - t_start, 1e-6))
-
-    bw = float(np.median(samples))
-    Log.print_with_color(
-        f"[Bandwidth][legacy] {bw:.1f} MB/s  "
-        f"(samples: {[f'{s:.1f}' for s in samples]} MB/s, payload={payload_size_mb} MB x{runs})",
-        "cyan")
-    return bw
-
-
-def _measure_bandwidth_direct(channel, client_id: str,
-                              payload_size_mb: float = 4.0,
-                              runs: int = 5) -> float:
+                      payload_size_mb: float = 4.0,
+                      runs: int = 5) -> float:
     """
     Đo băng thông uplink egress của device này (device → broker) qua RabbitMQ.
     Returns: bandwidth ước tính (MB/s).

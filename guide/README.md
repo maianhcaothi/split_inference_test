@@ -7,9 +7,7 @@ into charts.
 Read this directory and you can make any project emit results that look identical to
 every other project's — same filenames, same line formats, same charts, same colors.
 
-> **Scope.** Throughput, latency, device utilization, and — optionally — free time
-> ([10](10-free-time.md)): how much of each device and each machine was idle.
-> Model-accuracy metrics
+> **Scope.** Throughput, latency, and device utilization. Model-accuracy metrics
 > (mAP and friends) are deliberately **out of scope** — nothing here depends on
 > ground-truth labels or a detection task. The pipeline being measured can be doing
 > anything: inference, transcoding, ETL, simulation.
@@ -18,8 +16,7 @@ every other project's — same filenames, same line formats, same charts, same c
 
 ## The contract, in one paragraph
 
-A run produces **six required plain-text log files** in one directory (plus optional
-ones). Every line begins with a
+A run produces **seven plain-text log files** in one directory. Every line begins with a
 nanosecond-epoch timestamp taken on the **server's** clock, followed by `key=value`
 pairs. Every file is truncated at run start. Conform to
 [01-result-format.md](01-result-format.md) and the notebook in
@@ -34,10 +31,7 @@ that is the entire point of fixing the format.
 ├── utilization.log           per-device busy ratio         one line per device
 ├── utilization_group.log     utilization rolled up         per group, per group/role, SYSTEM
 ├── latency_group.log         latency distributions         per group/role + per group + SYSTEM
-├── events_ns.log             control-plane events          one line per event (optional)
-├── free_time.log             per-device idle time          one line per device (optional)
-├── free_time_group.log       free time rolled up           per group, per machine, SYSTEM (optional)
-└── free_time_series.log      free time over the run        one line per device per bucket (optional)
+└── events_ns.log             control-plane events          one line per event (optional)
 ```
 
 ---
@@ -56,7 +50,6 @@ that is the entire point of fixing the format.
 | 07 | [chart-catalogue.md](07-chart-catalogue.md) | building a specific chart |
 | 08 | [build-pipeline.md](08-build-pipeline.md) | building the notebook that produces the charts |
 | 09 | [port-checklist.md](09-port-checklist.md) | last — verifying the port is complete |
-| 10 | [free-time.md](10-free-time.md) | measuring how much of the fleet was idle (optional) |
 
 **If you are producing results:** 01 → 02 → 03 → 04 → 05 → 09.
 **If you are visualizing existing results:** 01 → 06 → 07 → 08 → 09.

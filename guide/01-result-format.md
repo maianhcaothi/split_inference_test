@@ -45,8 +45,7 @@ This grammar is why one 12-line parser reads every file
 
 ## 2 · File inventory
 
-Six required files plus four optional ones. All in one directory. All truncated at run
-start.
+Seven files. All in one directory. All truncated at run start.
 
 | # | File | Written | Granularity | Required |
 |---|---|---|---|---|
@@ -57,18 +56,10 @@ start.
 | 5 | `utilization_group.log` | shutdown | per group, per group/role, + `SYSTEM` | **MUST** |
 | 6 | `latency_group.log` | shutdown | per group/role, per group, + `SYSTEM` | **MUST** |
 | 7 | `events_ns.log` | live | one line per control event | **MAY** |
-| 8 | `free_time.log` | shutdown | one line per device | **MAY** |
-| 9 | `free_time_group.log` | shutdown | per group, per group/role, per machine, + `SYSTEM` | **MAY** |
-| 10 | `free_time_series.log` | shutdown | one line per device per time bucket | **MAY** |
 
-Files 8–10 are one feature — emit all three or none. They measure **free time**: the
-wall clock in which a device did no work of any kind. See
-[10-free-time.md](10-free-time.md) for the method and for why free time is neither
-utilization nor `1 − utilization`.
-
-> **Naming note.** The reference implementation names files 2, 3, 5, 6, 9
+> **Naming note.** The reference implementation names files 2, 3, 5, 6
 > `fps_cluster_ns.log`, `fps_cluster.log`, `utilization_cluster.log`,
-> `latency_cluster.log`, `free_time_cluster.log`. Either name set is conformant — pick one **per project** and
+> `latency_cluster.log`. Either name set is conformant — pick one **per project** and
 > keep it stable. The parsers in [08](08-build-pipeline.md) take the filename as a
 > parameter. Do not mix the two naming schemes within one project.
 
@@ -308,121 +299,10 @@ human reading and for **vertical rules on a time-axis chart**
 
 ---
 
-### 3.8 `free_time.log` — per-device idle time (optional)
-
-One line per device, written as each device's report is drained at shutdown. **Free
-time** is the wall clock in which the device did nothing at all — no input, no compute,
-no encode/decode, no transfer, no bookkeeping — computed as the run span minus the
-**union** of every one of its lanes' busy intervals.
-
-```
-1786024095544125400 client=7e3dd352-8b9a-4d6b-8173-412705d9bbe3 role=edge  machine=machine-2 cluster=intermediate_queue_0 device=cpu  span_s=467.394 busy_s=181.004 free_s=286.390 free=61.28% gaps=57 longest_free_ms=9821.400 host_idle=54.10%
-1786024095544125400 client=c6fdabe4-63e1-45f7-ad21-ef4de628bd3b role=cloud machine=machine-7 cluster=intermediate_queue_0 device=cuda span_s=599.152 busy_s=571.930 free_s= 27.222 free= 4.54% gaps=170 longest_free_ms=812.100 host_idle=11.30%
-```
-
-| Key | Meaning |
-|---|---|
-| col 1 | ns-epoch **arrival** of the report at the server — not a device timestamp |
-| `client` | stable device id |
-| `role` | the device's stage class |
-| `machine` | the host this device process runs on. Several devices MAY share one |
-| `span_s` | `end − start` on the device's own clock |
-| `busy_s` | measure of the **merged** busy intervals across all lanes |
-| `free_s` | `span_s − busy_s` |
-| `free` | `free_s / span_s` as a percent |
-| `gaps` | number of separate free intervals |
-| `longest_free_ms` | the longest single one |
-| `host_idle` | OS-level idle share of the whole machine over the run. Optional |
-
-**Rules**
-- `busy_s` MUST be a **union**, never a sum of per-stage timers. A sum can exceed
-  `span_s` whenever two lanes overlap, which is normal for a pipelined device.
-- `busy_s + free_s` MUST equal `span_s` exactly.
-- `free` MUST be ≤ 100%.
-- `free` and `utilization` ([§3.4](#34-utilizationlog--per-device-busy-ratio)) measure
-  different things and MUST NOT be expected to sum to 100%.
-
----
-
-### 3.9 `free_time_group.log` — free time rolled up (optional)
-
-Six line kinds, all in one file.
-
-```
-1786024095544125400 cluster=intermediate_queue_0 ALL devices=8 free=48.21% free_mean=46.02% free_s=2055.900 span_s=4264.621
-1786024095544125400 cluster=intermediate_queue_0 role=edge devices=6 free=61.28% free_mean=60.11% free_s=1719.200 span_s=2805.700
-1786024095544125400 cluster=intermediate_queue_0 FREE reason=input free_s=1802.400 share=87.67%
-1786024095544125400 cluster=intermediate_queue_0 KIND kind=inference busy_s=1204.700 share=28.25%
-1786024095544125400 MACHINE machine=machine-2 devices=3 free=12.40% free_s=57.900 span_s=467.394 merge_slop_s=0.000 host_idle=54.10%
-1786024095544125400 SYSTEM devices=12 clusters=2 machines=12 free=39.55% free_mean=38.10% free_s=2643.700 span_s=6684.796
-```
-
-| Line kind | Marked by | Covers |
-|---|---|---|
-| group total | `cluster=` + `ALL` | every device in that group |
-| group × role | `cluster=` + `role=` | devices of one role in one group |
-| free breakdown | `FREE` + `reason=` | why that scope was free |
-| busy breakdown | `KIND` + `kind=` | where that scope's busy time went |
-| machine | `MACHINE` + `machine=` | every device **process** on one host |
-| system | `SYSTEM` | every device |
-
-| Key | Definition |
-|---|---|
-| `free` | **pooled**: `Σfree / Σspan`, weighting each device by how long it ran |
-| `free_mean` | plain mean of per-device percentages. Present on `ALL`/`SYSTEM` |
-| `share` | this reason's portion of the scope's free time, or this kind's portion of its span |
-| `merge_slop_s` | non-busy time swallowed by capping the shipped interval list |
-| `host_idle` | mean OS-level idle share reported by the devices on that machine |
-
-**Rules**
-- `MACHINE` lines MUST come from the **union of the busy intervals** of the device
-  processes on that host, not from their ratios: two devices that are each 50% free can
-  keep a machine 100% busy by interleaving. Intervals MUST NOT be unioned across
-  machines — that is the one place device timestamps are compared, and it is valid only
-  because processes on one host share a clock.
-- `FREE reason=` shares MUST sum to 100% of that scope's free time. Overlapping reasons
-  MUST be attributed in a fixed published priority so nothing is double counted;
-  whatever no reason covers MUST be reported as `unaccounted` rather than dropped.
-- `KIND` shares MAY sum to more than 100%: per-kind sums overlap across lanes by
-  construction. Only the merged `busy_s` in [§3.8](#38-free_timelog--per-device-idle-time-optional)
-  is exclusive.
-- A machine that runs no devices (e.g. the controller's own host) MAY appear with
-  `devices=0` and only `host_idle`.
-
----
-
-### 3.10 `free_time_series.log` — free time over the run (optional)
-
-One line per device per fixed-width time bucket. This is the plottable "when was each
-device idle" series; it is written at shutdown but describes the whole run.
-
-```
-1786024095544125400 client=7e3dd352 role=edge machine=machine-2 cluster=intermediate_queue_0 i=0 t_offset_s=0.000 bucket_s=1.000 free=12.40%
-1786024095544125400 client=7e3dd352 role=edge machine=machine-2 cluster=intermediate_queue_0 i=1 t_offset_s=1.000 bucket_s=1.000 free=88.10%
-```
-
-| Key | Meaning |
-|---|---|
-| col 1 | ns-epoch arrival of the report at the server, identical on every line of a report |
-| `i` | bucket index within that device's run |
-| `t_offset_s` | seconds since **that device's own start** |
-| `bucket_s` | bucket width |
-| `free` | percent of that bucket the device spent doing nothing |
-
-**Rules**
-- The leading timestamp is the report's server-clock arrival, exactly as in
-  [§3.4](#34-utilizationlog--per-device-busy-ratio); the position in the run is carried
-  by `t_offset_s`, which is on the **device's** clock. Do not conflate them: devices
-  start at different moments and their offsets are not directly comparable.
-- `bucket_s` MUST be carried on every line rather than assumed, so a long run may widen
-  its buckets to bound the file size without breaking readers.
-
----
-
 ## 4 · Truncation and lifecycle
 
 ```
-startup     truncate every file it emits; purge the measurement queues
+startup     truncate all seven files; purge the measurement queues
    │
 START       record the shared start time  (t0 for every rate)
    │
@@ -432,14 +312,12 @@ drain       keep collecting after the first stage finishes (02 §5)
    │
 shutdown    group_rate.log
             utilization.log → utilization_group.log, latency_group.log
-            free_time.log → free_time_group.log, free_time_series.log   (optional)
    │
 archive     copy everything + the config that produced it  (05)
 ```
 
 **Rules**
-- Every file the project emits MUST be truncated at startup, before any worker can
-  write — including the optional ones it chooses to emit. Truncating
+- All seven files MUST be truncated at startup, before any worker can write. Truncating
   per-worker instead of once centrally causes late-starting workers to wipe files that
   earlier workers are already writing.
 - Measurement queues MUST be purged at startup so a crashed run's stale messages cannot

@@ -23,51 +23,36 @@ with open('config.yaml', 'r', encoding='utf-8') as file:
     config = yaml.safe_load(file)
 
 
-def _apply_torch_threads(cfg, override):
+def _apply_torch_threads(cfg, layer_id, override):
     """Cap this process's torch intra-op threads.
 
-    torch defaults to one thread per core it can SEE, per process. Whether that
-    default is right depends entirely on how the devices are deployed, and the two
-    topologies want opposite things:
+    torch defaults to one thread per core PER PROCESS, which is right for one
+    process per machine and badly wrong here: 9 edge processes on one 20-core box
+    ask for 180 compute threads on 20 cores. The oversubscription slows every
+    process down without raising aggregate throughput.
 
-      * one VM (or machine) per device — os.cpu_count() is already this device's
-        own vCPU count, so torch's default is right and nothing should be divided.
-        Use 0. If the VMs sit on an oversubscribed host, a *smaller* value can
-        still win: a 4-vCPU VM needs 4 physical cores free at once before a
-        parallel region can run, and its threads busy-spin at each fork-join
-        barrier whenever the hypervisor deschedules one of them — which is how a
-        4-vCPU VM ends up slower than a 1-vCPU VM on the same host. Try
-        --threads 1 there and compare.
-      * several device processes sharing ONE OS — os.cpu_count() is the whole
-        host, so every process asks for all of it (9 edges on 20 cores => 180
-        threads on 20 cores). Set procs_per_host to how many processes share the
-        machine and 'auto' will divide by it.
-
-    0/None leaves torch untouched; an int sets it directly; 'auto' =
-    cores // performance.procs_per_host.
+    'auto' divides the host's cores by the number of processes that share this
+    role, which matches the deployment (all edges on one machine, all clouds on
+    another). 0/None leaves torch untouched; an int sets it directly.
     """
-    perf = cfg.get("performance", {}) or {}
-    want = override if override is not None else perf.get("torch_threads", 0)
+    want = override if override is not None else cfg.get("performance", {}).get("torch_threads", 0)
     if want in (None, 0, "0", False):
         return
-    cores = os.cpu_count() or 1
     if isinstance(want, str) and want.strip().lower() == "auto":
-        # Defaults to 1 => 'auto' is a no-op divide unless the deployment really
-        # does pack several device processes into one OS. Guessing from
-        # server.clients would be wrong for the VM-per-device case, where each
-        # guest already sees only its own vCPUs.
-        procs = max(1, int(perf.get("procs_per_host", 1) or 1))
-        want = max(1, cores // procs)
+        clients = cfg["server"]["clients"]
+        # layer_id 1 == edge (clients[0]), anything else == cloud (clients[1]).
+        peers = clients[0] if layer_id == 1 else clients[1]
+        want = max(1, (os.cpu_count() or 1) // max(1, int(peers)))
     try:
         n = max(1, int(want))
     except (TypeError, ValueError):
         print(f"[Threads] ignoring invalid performance.torch_threads={want!r}")
         return
     torch.set_num_threads(n)
-    print(f"[Threads] torch intra-op threads = {n} (this OS sees {cores} core(s))")
+    print(f"[Threads] torch intra-op threads = {n} (host has {os.cpu_count()} cores)")
 
 
-_apply_torch_threads(config, args.threads)
+_apply_torch_threads(config, args.layer_id, args.threads)
 
 client_id = uuid.uuid4()
 address = config["rabbit"]["address"]
@@ -131,11 +116,7 @@ if __name__ == "__main__":
         if clustering_cfg.get("measure_bandwidth", True):
             try:
                 from src.Profiler import measure_bandwidth
-                bandwidth_mb_s = measure_bandwidth(
-                    channel, str(client_id),
-                    payload_size_mb=clustering_cfg.get("bandwidth_payload_mb"),
-                    runs=clustering_cfg.get("bandwidth_runs"),
-                    mode=clustering_cfg.get("measure_mode", "new"))
+                bandwidth_mb_s = measure_bandwidth(channel, str(client_id))
             except Exception as e:
                 src.Log.print_with_color(f"[Bandwidth] Warning: {e}", "yellow")
                 if not channel.is_open:
@@ -147,7 +128,7 @@ if __name__ == "__main__":
     data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
             "message": "Hello from Client!", "layer_times": layer_times,
             "bandwidth_mb_s": bandwidth_mb_s, "client_name": args.name}
-    scheduler = Scheduler(client_id, args.layer_id, channel, device, name=args.name)
+    scheduler = Scheduler(client_id, args.layer_id, channel, device)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")
     client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device)

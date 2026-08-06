@@ -195,6 +195,8 @@ map/
 detections.json
 detections_stream.jsonl
 metrics_pivoted_*.csv
+clustering_input.json
 
 # ...but archived run results ARE the deliverable (the *.log rule above would eat them)
 !results/**/*.log
+!results/**/clustering_input.json

@@ -27,22 +27,42 @@ def _apply_torch_threads(cfg, layer_id, override):
     """Cap this process's torch intra-op threads.
 
     torch defaults to one thread per core PER PROCESS, which is right for one
-    process per machine and badly wrong here: 9 edge processes on one 20-core box
-    ask for 180 compute threads on 20 cores. The oversubscription slows every
-    process down without raising aggregate throughput.
+    process per machine and badly wrong when they are co-located: 9 edge
+    processes on one 20-core box ask for 180 compute threads on 20 cores. The
+    oversubscription slows every process down without raising aggregate
+    throughput.
 
-    'auto' divides the host's cores by the number of processes that share this
-    role, which matches the deployment (all edges on one machine, all clouds on
-    another). 0/None leaves torch untouched; an int sets it directly.
+    'auto' divides the host's cores by how many processes of this role share
+    this machine. That count is performance.procs_per_machine; left unset it
+    falls back to "the whole role is on one box" (clients[0] edges / clients[1]
+    clouds), which is the co-located deployment the cap was written for.
+
+    Set procs_per_machine: 1 when each device is its own VM. The fallback is
+    actively harmful there: n_core // 9 floors to 0 for every VM with fewer than
+    9 cores, so max(1, ...) pins a 4-core, a 2-core and a 1-core VM all to ONE
+    thread. That wastes 3 of 4 cores AND flattens the hardware differences the
+    clustering is supposed to find — every edge profiles to the same speed, so
+    the clusters come out of measurement noise. See testbed.md.
+
+    0/None leaves torch untouched; an int sets it directly.
     """
-    want = override if override is not None else cfg.get("performance", {}).get("torch_threads", 0)
+    perf = cfg.get("performance", {})
+    want = override if override is not None else perf.get("torch_threads", 0)
     if want in (None, 0, "0", False):
         return
     if isinstance(want, str) and want.strip().lower() == "auto":
-        clients = cfg["server"]["clients"]
-        # layer_id 1 == edge (clients[0]), anything else == cloud (clients[1]).
-        peers = clients[0] if layer_id == 1 else clients[1]
-        want = max(1, (os.cpu_count() or 1) // max(1, int(peers)))
+        per_machine = perf.get("procs_per_machine", None)
+        if per_machine in (None, "", "auto"):
+            clients = cfg["server"]["clients"]
+            # layer_id 1 == edge (clients[0]), anything else == cloud (clients[1]).
+            peers = int(clients[0] if layer_id == 1 else clients[1])
+            src.Log.print_with_color(
+                f"[Threads] performance.procs_per_machine unset; assuming all "
+                f"{peers} processes of this role share this machine. Set it to 1 "
+                f"if this device is its own VM.", "yellow")
+        else:
+            peers = int(per_machine)
+        want = max(1, (os.cpu_count() or 1) // max(1, peers))
     try:
         n = max(1, int(want))
     except (TypeError, ValueError):

@@ -847,10 +847,23 @@ def print_result(result: OptimizationResult, solver: DeterministicSimilarityAssi
         print(f"Cloud cluster {c}: servers={cloud_groups[c]} types={[cloud_types[i] for i in cloud_groups[c]]}")
     print("-" * 100)
 
+    def _named(idx_list, names):
+        """Indices annotated with the device names behind them.
+
+        The bare indices are positions in the solver's feature matrix, not device
+        numbers, so on their own they say nothing about which machine ended up
+        where — and if the rows are ordered by arrival they do not even mean the
+        same thing twice. Print both: the index because the rest of the output is
+        keyed by it, the name because that is the question being asked. A solver
+        built without names (the simulated path) keeps the old bare output."""
+        if any(i >= len(names) for i in idx_list) or all(n == "?" for n in names):
+            return str(idx_list)
+        return f"{idx_list}  {[names[i] for i in idx_list]}"
+
     for d in result.details:
         print(f"Edge cluster {d.edge_cluster_id} <-> Cloud cluster {d.cloud_cluster_id}")
-        print(f"  Clients            : {d.clients}")
-        print(f"  Servers            : {d.servers}")
+        print(f"  Clients            : {_named(d.clients, client_types)}")
+        print(f"  Servers            : {_named(d.servers, cloud_types)}")
         print(f"  Best cut           : {d.best_cut}")
         print(f"  Producer rate      : {d.producer_rate:.6f}")
         if np.isinf(d.service_rate):

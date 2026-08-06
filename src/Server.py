@@ -1,7 +1,9 @@
 import numpy as np
 import os
+import re
 import sys
 import glob
+import json
 import socket
 import time
 import base64
@@ -241,6 +243,10 @@ class Server:
         self.client_profile_data = {}   # {client_id_str: np.array of per-layer times}
         self.client_bandwidth_data = {} # {client_id_str: float MB/s}
         self.client_name_data = {}      # {client_id_str: str name}
+        # Row order of the solver's feature matrices, set by _run_hungarian and
+        # consumed by notify_clients to map row -> client (see _ordered_clients).
+        self.cluster_edge_order = []
+        self.cluster_cloud_order = []
         self._stopping = False
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
@@ -1728,22 +1734,50 @@ class Server:
             f"[Adaptive] {queue}: cut {old_cut}->{new_cut} {direction} "
             f"(high={high_frac:.2f} low={low_frac:.2f})", "green")
 
+    @staticmethod
+    def _natural_key(s):
+        """Sort key where machine-2 < machine-10 (lexicographic puts 10 first)."""
+        return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", str(s))]
+
+    def _ordered_clients(self, layer_id, require_profile=False):
+        """Clients of one role in an order that means the same thing every run.
+
+        list_clients is in REGISTER arrival order, and with 9 edge processes
+        started in parallel that order is a race: the same VM is row 3 in one run
+        and row 7 in the next. Everything downstream is indexed by that position —
+        the solver's feature matrix, and Clustering.agglomerative_cluster which
+        numbers clusters by their smallest member index — so the printed cluster
+        ids and their member lists moved between runs even when the partition of
+        real machines did not. Sorting by --name (naturally, so machine-2 comes
+        before machine-10) makes row i the same machine in every run.
+
+        The name is used ONLY for ordering; identity on the wire is still the
+        uuid. Unnamed clients sort last, by uuid, so a partly-named fleet is still
+        deterministic — but pass --name if you want to read the output.
+
+        Never re-derive this order at the call site: notify_clients maps solver
+        row i back to a client, so a different order there would send cluster k's
+        cut to the wrong machines.
+        """
+        out = [(cid, lid) for cid, lid in self.list_clients if lid == layer_id]
+        if require_profile:
+            out = [e for e in out if str(e[0]) in self.client_profile_data]
+        return sorted(out, key=lambda e: (
+            self.client_name_data.get(str(e[0])) is None,
+            self._natural_key(self.client_name_data.get(str(e[0]), "")),
+            str(e[0]),
+        ))
+
     def _run_hungarian(self):
         cfg = self.config.get("clustering", {})
         network_rate = float(cfg.get("network_rate_mb_s", 1000.0))
         max_clusters = cfg.get("max_clusters", 1)
 
         # Dùng real profiling data nếu tất cả client đã gửi
-        edge_times_list = [
-            self.client_profile_data[str(cid)]
-            for cid, lid in self.list_clients
-            if lid == 1 and str(cid) in self.client_profile_data
-        ]
-        cloud_times_list = [
-            self.client_profile_data[str(cid)]
-            for cid, lid in self.list_clients
-            if lid == len(self.total_clients) and str(cid) in self.client_profile_data
-        ]
+        edge_entries = self._ordered_clients(1, require_profile=True)
+        cloud_entries = self._ordered_clients(len(self.total_clients), require_profile=True)
+        edge_times_list = [self.client_profile_data[str(cid)] for cid, _ in edge_entries]
+        cloud_times_list = [self.client_profile_data[str(cid)] for cid, _ in cloud_entries]
         n_edge = sum(1 for _, lid in self.list_clients if lid == 1)
         n_cloud = sum(1 for _, lid in self.list_clients if lid == len(self.total_clients))
         profile_source = cfg.get("profile_source", "auto")
@@ -1760,15 +1794,13 @@ class Server:
                 f"[Clustering] Using REAL profiles ({n_edge} edge, {n_cloud} cloud) [profile_source={profile_source}]", "cyan")
             N = len(edge_times_list)
             M = len(cloud_times_list)
-            edge_clients = [cid for cid, lid in self.list_clients
-                            if lid == 1 and str(cid) in self.client_profile_data]
+            edge_clients = [cid for cid, _ in edge_entries]
             rates_matrix = np.array([
                 [self.client_bandwidth_data.get(str(cid), network_rate)] * M
                 for cid in edge_clients
             ]) if edge_clients else np.full((N, M), network_rate)
             self._audit_bandwidth(edge_clients, network_rate)
-            cloud_clients = [cid for cid, lid in self.list_clients
-                             if lid == len(self.total_clients) and str(cid) in self.client_profile_data]
+            cloud_clients = [cid for cid, _ in cloud_entries]
             solver = DeterministicSimilarityAssignmentSolver(
                 client_layer_times=np.vstack(edge_times_list),
                 server_layer_times=np.vstack(cloud_times_list),
@@ -1786,6 +1818,13 @@ class Server:
             ]
             result = solver.solve_best_over_k("hungarian", max_clusters=max_clusters)["best_result"]
             print_result(result, solver, title="HUNGARIAN MATCHING RESULT (real profiles)")
+            self._dump_clustering_input(solver, edge_clients, cloud_clients,
+                                        rates_matrix, network_rate, max_clusters)
+            # Exactly the rows the solver saw — the profiled clients, in the order
+            # they were stacked. An edge with no profile is deliberately absent:
+            # it has no row, so it has no cluster, and notify_clients falls back
+            # to the default queue for it rather than reading someone else's.
+            edge_order, cloud_order = edge_entries, cloud_entries
         else:
             src.Log.print_with_color(
                 f"[Clustering] Using SIMULATED profiles (DEVICE_A/B/C hardcoded) [profile_source={profile_source}]", "yellow")
@@ -1804,8 +1843,76 @@ class Server:
             results = run_manual_hungarian_case(manual_cfg)
             solver = results["solver"]
             result = results["hungarian"]
+            # Simulated rows are num_A A's then num_B B's then num_C C's, with no
+            # tie to any real machine, so which machine lands on which row is a
+            # free choice. Take the stable one.
+            edge_order = self._ordered_clients(1)
+            cloud_order = self._ordered_clients(len(self.total_clients))
 
+        # The order the solver's rows were built in. notify_clients maps row i
+        # back to a client and MUST use this same list, never re-derive it.
+        self.cluster_edge_order = edge_order
+        self.cluster_cloud_order = cloud_order
         return solver, result
+
+    def _dump_clustering_input(self, solver, edge_clients, cloud_clients,
+                               rates_matrix, network_rate, max_clusters):
+        """Write everything the solver was given to clustering_input.json.
+
+        The server prints only the solver's ANSWER (K, best_cuts, throughput), so
+        when the answer changes between runs there is nothing to compare — you
+        cannot tell whether an edge profiled slower, a bandwidth sample came out
+        high, or nothing moved at all and only the row order changed. This is the
+        input side of that pair, and tools/replay_clustering.py re-runs the exact
+        same solver on it offline (no broker, no model needed) and sweeps the one
+        input that is genuinely uncertain, the per-edge egress rate.
+
+        Never fatal: a failed dump costs a diagnostic, not the run."""
+        try:
+            path = f"{self.config['log-path']}/clustering_input.json"
+            names = getattr(solver, "client_type_names", [])
+            cnames = getattr(solver, "cloud_type_names", [])
+            data = {
+                "model_name": self.model_name,
+                "batch_size": self.batch_size,
+                "max_clusters": int(max_clusters),
+                "network_rate_mb_s": float(network_rate),
+                # No per-edge divisor is applied anywhere (see _audit_bandwidth):
+                # each edge's own measurement IS its share when the edges measure
+                # concurrently. Recorded so the replay prints the same assumption.
+                "egress_share": 1,
+                "compress": dict(self.compress),
+                "input_data_size_mb": float(get_raw_input_mb(self.batch_size)),
+                "cut_data_sizes_mb": [
+                    float(v) for v in get_cut_data_sizes(self.model_name, self.batch_size)
+                ],
+                "edges": [
+                    {
+                        "client_id": str(cid),
+                        "name": names[i] if i < len(names) else None,
+                        "layer_times_s": [float(v) for v in solver.client_layer_times[i]],
+                        "measured_mb_s": self.client_bandwidth_data.get(str(cid)),
+                        "rate_used_mb_s": float(rates_matrix[i][0]),
+                    }
+                    for i, cid in enumerate(edge_clients)
+                ],
+                "clouds": [
+                    {
+                        "client_id": str(cid),
+                        "name": cnames[j] if j < len(cnames) else None,
+                        "layer_times_s": [float(v) for v in solver.server_layer_times[j]],
+                    }
+                    for j, cid in enumerate(cloud_clients)
+                ],
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            src.Log.print_with_color(
+                f"[Clustering] solver input saved to {path} "
+                f"(replay: python tools/replay_clustering.py {path})", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(
+                f"[Clustering] could not save clustering_input.json: {e}", "yellow")
 
     def _audit_bandwidth(self, edge_clients, network_rate):
         """Print every edge's measured egress rate plus the spread, and warn when
@@ -1961,8 +2068,11 @@ class Server:
                         inv_matching = {int(matching[k]): k for k in range(K)}
                         best_cuts    = self._cap_initial_cuts(best_cuts)
 
-                        edge_ord  = [(cid, lid) for cid, lid in self.list_clients if lid == 1]
-                        cloud_ord = [(cid, lid) for cid, lid in self.list_clients if lid == len(self.total_clients)]
+                        # The SAME order _run_hungarian built the solver's rows
+                        # in (see _ordered_clients). Re-deriving it here would
+                        # silently ship cluster k's cut to the wrong machines.
+                        edge_ord  = self.cluster_edge_order
+                        cloud_ord = self.cluster_cloud_order
 
                         self.client_assignments = {}
                         for i, (cid, _) in enumerate(edge_ord):

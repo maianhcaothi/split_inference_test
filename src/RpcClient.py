@@ -49,6 +49,7 @@ class RpcClient:
             backpressure = self.response.get("backpressure", {}) or {}
             detections = self.response.get("detections", {}) or {}
             map_cfg = self.response.get("map", {}) or {}
+            free_time = self.response.get("free_time", {}) or {}
 
             if model is not None:
                 file_path = f'{model_name}.pt'
@@ -95,7 +96,7 @@ class RpcClient:
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive, multithreading, backpressure, detections, map_cfg)
+            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive, multithreading, backpressure, detections, map_cfg, free_time)
 
             return False
         else:

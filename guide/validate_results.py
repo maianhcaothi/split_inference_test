@@ -11,9 +11,11 @@ PCT  = re.compile(r"^\d+(\.\d+)?%$")
 
 NAMES = {
     "group":   dict(rate_ns="group_rate_ns.log", rate="group_rate.log",
-                    util_g="utilization_group.log", lat="latency_group.log"),
+                    util_g="utilization_group.log", lat="latency_group.log",
+                    free_g="free_time_group.log"),
     "cluster": dict(rate_ns="fps_cluster_ns.log", rate="fps_cluster.log",
-                    util_g="utilization_cluster.log", lat="latency_cluster.log"),
+                    util_g="utilization_cluster.log", lat="latency_cluster.log",
+                    free_g="free_time_cluster.log"),
 }
 
 def lines(p):
@@ -139,6 +141,69 @@ def main(run_dir, scheme):
                         f"(p50 <= p95 <= max required)")
         if kv["kind"] == "e2e" and "role" in kv:
             errs.append(f"{N['lat']}:{i}: e2e lines must not carry role=")
+
+    # -- free time (01 §3.8-3.10): optional, but all three or none ----------
+    ft = {name: lines(d / name) for name in
+          ("free_time.log", N["free_g"], "free_time_series.log")}
+    present = [n for n, ls in ft.items() if ls is not None]
+    if present and len(present) != 3:
+        errs.append(f"free time: {', '.join(present)} present but "
+                    f"{', '.join(n for n in ft if n not in present)} missing "
+                    f"(files 8-10 are one feature: emit all three or none)")
+    for name, ls in ft.items():
+        for i, ln in enumerate(ls or [], 1):
+            if not TS.match(ln):
+                errs.append(f"{name}:{i}: does not start with a 19-digit ns timestamp")
+                break
+    for i, ln in enumerate(ft.get("free_time.log") or [], 1):
+        kv = dict(KV.findall(ln))
+        missing = [k for k in ("span_s", "busy_s", "free_s", "free") if k not in kv]
+        if missing:
+            errs.append(f"free_time.log:{i}: missing {', '.join(missing)}")
+            continue
+        if not PCT.match(kv["free"]):
+            errs.append(f"free_time.log:{i}: free must be percent-formatted, got {kv['free']!r}")
+        elif num(kv["free"]) > 100.0:
+            errs.append(f"free_time.log:{i}: free={kv['free']} exceeds 100% "
+                        f"(busy intervals were summed instead of merged)")
+        if abs((num(kv["busy_s"]) + num(kv["free_s"])) - num(kv["span_s"])) > 0.002:
+            errs.append(f"free_time.log:{i}: busy_s + free_s != span_s "
+                        f"({kv['busy_s']} + {kv['free_s']} != {kv['span_s']})")
+    fg = ft.get(N["free_g"]) or []
+    for i, ln in enumerate(fg, 1):
+        kv = dict(KV.findall(ln))
+        for key in ("free", "free_mean", "host_idle", "share"):
+            if key in kv and not PCT.match(kv[key]):
+                errs.append(f"{N['free_g']}:{i}: {key} must be percent-formatted, got {kv[key]!r}")
+            elif key in kv and num(kv[key]) > 100.0 and key != "share":
+                errs.append(f"{N['free_g']}:{i}: {key}={kv[key]} exceeds 100%")
+    if fg:
+        sysl = [l for l in fg if "SYSTEM" in l.split() and "free=" in l
+                and "KIND" not in l.split() and "FREE" not in l.split()]
+        if len(sysl) != 1:
+            errs.append(f"{N['free_g']}: expected exactly 1 SYSTEM summary line, found {len(sysl)}")
+        elif "free_mean" not in dict(KV.findall(sysl[0])):
+            errs.append(f"{N['free_g']}: SYSTEM line must carry free_mean beside free")
+        # reasons partition the free time of their scope, so their shares total 100%
+        scopes = {}
+        for l in fg:
+            if "FREE" not in l.split():
+                continue
+            kv = dict(KV.findall(l))
+            key = kv.get("cluster", "SYSTEM")
+            scopes.setdefault(key, 0.0)
+            scopes[key] += num(kv.get("share", "0"))
+        for key, tot in scopes.items():
+            if abs(tot - 100.0) > 0.5:
+                errs.append(f"{N['free_g']}: FREE reason shares for {key} sum to {tot:.1f}%, "
+                            f"expected 100% (unattributed free time must be reported "
+                            f"as reason=unaccounted, not dropped)")
+    for i, ln in enumerate(ft.get("free_time_series.log") or [], 1):
+        kv = dict(KV.findall(ln))
+        missing = [k for k in ("i", "t_offset_s", "bucket_s", "free") if k not in kv]
+        if missing:
+            errs.append(f"free_time_series.log:{i}: missing {', '.join(missing)}")
+            break
 
     print(f"\nvalidating {d}  (naming scheme: {scheme})")
     for w in warns:

@@ -8,12 +8,14 @@ from tqdm import tqdm
 import time
 import csv
 import os
+import socket
 import psutil
 import numpy as np
 
 from src.Compress import Encoder,Decoder
 import src.Log as Log
 from src.Model import inference, postprocess_yolo
+from src.FreeTime import FreeTimeTracker, write_report_log
 
 # Fixed cap on intermediate_queue depth (messages) before an edge waits.
 # Only only_cloud sends large raw frames (~150MB/msg), which can blow up
@@ -40,11 +42,15 @@ def _cap_samples(vals, cap=20000):
 
 
 class Scheduler:
-    def __init__(self, client_id, layer_id, channel, device):
+    def __init__(self, client_id, layer_id, channel, device, name=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.channel = channel
         self.device = device
+        # Which physical machine this device process runs on. Several device
+        # processes can share one host, so the server rolls free time up per
+        # machine as well as per device — see _send_free_time.
+        self.machine = name or socket.gethostname()
 
         # In-memory (ns_timestamp, event) pairs — replaces the old
         # timing_edge_*.log / timing_cloud_*.log files. Only this process
@@ -70,6 +76,19 @@ class Scheduler:
         # utilization.log during its shutdown collection step.
         self.utilization_queue = "utilization_queue"
         self.channel.queue_declare(self.utilization_queue, durable=False)
+
+        # Free time: the complement of utilization, and NOT derivable from it.
+        # utilization measures busy/total over one lane's get_input -> output
+        # window (so a wait inside that window counts as busy, and work on the
+        # other lane counts for nothing); free time merges every lane's real
+        # work intervals and asks how much wall clock is left over. Each device
+        # writes its own free_time_*.log and publishes the same report here for
+        # the server's shutdown roll-up. Reconfigured from config in
+        # inference_func; created enabled so a caller that never passes the
+        # config still gets the measurement.
+        self._ft = FreeTimeTracker()
+        self.freetime_queue = "freetime_queue"
+        self.channel.queue_declare(self.freetime_queue, durable=False)
 
         # Adaptive split-point (Mechanic 1). When on, the model is held whole and
         # the cut is applied per-batch; the edge follows SET_CUT from the server.
@@ -163,15 +182,20 @@ class Scheduler:
     def _check_backpressure(self, max_queue):
         """Stall the caller while the intermediate queue is at/above max_queue, so
         the edge can't outrun the cloud and flood the broker (RAM guard)."""
-        depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
+        # The depth probe is a broker round trip this device performs, so it is
+        # work; the stall that may follow is the device doing nothing, so it is
+        # free time tagged with its reason.
+        with self._ft.work("send"):
+            depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         if depth < max_queue:
             return
 
         Log.print_with_color(
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} >= max_queue={max_queue}, waiting", "yellow")
-        while depth >= max_queue and not self._mt_stop.is_set():
-            time.sleep(0.1)
-            depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
+        with self._ft.wait("backpressure"):
+            while depth >= max_queue and not self._mt_stop.is_set():
+                time.sleep(0.1)
+                depth = self.channel.queue_declare(self.intermediate_queue, passive=True).method.message_count
         Log.print_with_color(
             f"[BackPressure] '{self.intermediate_queue}' depth={depth} < max_queue={max_queue}, resuming", "green")
 
@@ -243,27 +267,29 @@ class Scheduler:
 
     def send_next_layer(self, intermediate_queue, data, compress):
 
-        if compress["enable"]:
-            data["data"] = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None for t in
-                                     data["data"]]
-            data["data"], data["shape"] = Encoder(data_output=data["data"], num_bits=compress["num_bit"])
+        with self._ft.work("compress"):
+            if compress["enable"]:
+                data["data"] = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None for t in
+                                         data["data"]]
+                data["data"], data["shape"] = Encoder(data_output=data["data"], num_bits=compress["num_bit"])
 
-        else:
-            data["data"] = [t.cpu() if isinstance(t, torch.Tensor) else None for t in
-                                     data["data"]]
-        message = pickle.dumps({
-            "action": "OUTPUT",
-            "data": data
-        })
-        self.size_message = len(message)
+            else:
+                data["data"] = [t.cpu() if isinstance(t, torch.Tensor) else None for t in
+                                         data["data"]]
+        with self._ft.work("send"):
+            message = pickle.dumps({
+                "action": "OUTPUT",
+                "data": data
+            })
+            self.size_message = len(message)
 
 
-        self.channel.basic_publish(
-            exchange='',
-            routing_key=intermediate_queue,
-            body=message,
-            #body= "."
-        )
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=intermediate_queue,
+                body=message,
+                #body= "."
+            )
 
     def _load_gt_dict(self, gt_dir="datasets/groundtruth"):
         if not os.path.isdir(gt_dir):
@@ -479,13 +505,16 @@ class Scheduler:
         — the infer thread only enqueues a marker onto _fps_q."""
         q = self._fps_q
         if q is None:
-            return
+            return 0
+        n = 0
         while True:
             try:
                 q.get_nowait()
             except _queue.Empty:
                 break
             self._send_fps_done()
+            n += 1
+        return n
 
     def _compute_utilization(self, events, role):
         """Fold this device's in-memory timing events (one (ns_timestamp, event)
@@ -572,6 +601,53 @@ class Scheduler:
         except Exception as e:
             Log.print_with_color(f"[Utilization] send failed: {e}", "yellow")
 
+    def _free_time_log_path(self, role):
+        return (f"free_time_{role}_{self._cluster_tag()}_"
+                f"{str(self.client_id).replace('-', '')[:12]}.log")
+
+    def _send_free_time(self, role):
+        """Write this device's own free-time log, then publish the same report to
+        freetime_queue for the server's synthetic view.
+
+        Both, deliberately. The local file is the device's own record and is the
+        only copy that survives a broker/server problem (it also carries the full
+        per-bucket series, which is the plottable artifact); the published report
+        is what lets the server answer 'how much of the FLEET was idle' in one
+        place. The report parks on the broker until the server's shutdown
+        collection drains it, exactly like the utilization report — a cloud
+        finishes only after the server stopped consuming rpc_queue.
+
+        Telemetry: every failure path degrades to a warning. A free-time number
+        is never worth killing a finished run for."""
+        rep = self._ft.report(
+            client_id=str(self.client_id),
+            layer_id=self.layer_id,
+            role=role,
+            cluster_id=self.intermediate_queue,
+            machine=self.machine,
+            device=self.device,
+        )
+        if rep is None:
+            return
+        try:
+            path = write_report_log(self._free_time_log_path(role), rep)
+            Log.print_with_color(
+                f"[FreeTime][{role}] free={rep['free_pct']:.2f}% "
+                f"({rep['free_ns'] / 1e9:.3f}s of {rep['span_ns'] / 1e9:.3f}s, "
+                f"{rep['free_gaps']} gap(s), longest {rep['longest_free_ms']:.0f}ms) "
+                f"-> {path}", "cyan")
+        except Exception as e:
+            Log.print_with_color(f"[FreeTime] local log write failed: {e}", "yellow")
+        try:
+            self.channel.queue_declare(self.freetime_queue, durable=False)
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=self.freetime_queue,
+                body=pickle.dumps(rep),
+            )
+        except Exception as e:
+            Log.print_with_color(f"[FreeTime] send failed: {e}", "yellow")
+
     def _send_pred_dir_to_server(self):
         """Zip this device's own map/pred/<cluster>/*.txt files and publish them
         to map_pred_queue, tagged with the cluster id (self.intermediate_queue),
@@ -644,14 +720,17 @@ class Scheduler:
                 f"[Adaptive][edge] enabled, L={self._L}, start cut={self.current_cut}", "cyan")
 
         self._mark_edge("start")
+        self._ft.start()
         while True:
-            ret, frame = cap.read()
+            with self._ft.work("capture"):
+                ret, frame = cap.read()
+                if ret:
+                    frame = cv2.resize(frame, (640, 640))
+                    frame = frame.astype('float32') / 255.0
+                    tensor = torch.from_numpy(frame).permute(2, 0, 1)  # shape: (3, 640, 640)
+                    input_image.append(tensor)
             if not ret:
                 break
-            frame = cv2.resize(frame, (640, 640))
-            frame = frame.astype('float32') / 255.0
-            tensor = torch.from_numpy(frame).permute(2, 0, 1)  # shape: (3, 640, 640)
-            input_image.append(tensor)
 
             if len(input_image) == batch_size:
                 if self.adaptive_on:
@@ -663,11 +742,12 @@ class Scheduler:
                 edge_start_wall = time.time()
 
                 _stack_start = time.perf_counter()
-                input_image = torch.stack(input_image)
-                if mode != "only_cloud":
-                    # only_cloud: edge does no GPU inference, keep frames on CPU
-                    # to avoid a wasted CPU->GPU->CPU round trip before sending.
-                    input_image = input_image.to(self.device)
+                with self._ft.work("tensor"):
+                    input_image = torch.stack(input_image)
+                    if mode != "only_cloud":
+                        # only_cloud: edge does no GPU inference, keep frames on CPU
+                        # to avoid a wasted CPU->GPU->CPU round trip before sending.
+                        input_image = input_image.to(self.device)
                 stack_ms = (time.perf_counter() - _stack_start) * 1000
 
                 inference_ms = 0.0
@@ -678,13 +758,14 @@ class Scheduler:
                 # ===== ONLY CLOUD =====
                 if mode == "only_cloud":
                     frames_cpu = input_image
-                    y = {
-                        "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
-                        "width": width,
-                        "height": height,
-                        "edge_start_time": edge_start_wall,
-                        "batch_id": batch_id,
-                    }
+                    with self._ft.work("tensor"):
+                        y = {
+                            "data": [frames_cpu[i].clone() for i in range(len(frames_cpu))],
+                            "width": width,
+                            "height": height,
+                            "edge_start_time": edge_start_wall,
+                            "batch_id": batch_id,
+                        }
 
                     _wait_start = time.perf_counter()
                     self._mark_edge("queue_wait_start")
@@ -705,32 +786,35 @@ class Scheduler:
 
                     _inf_start = time.perf_counter()
                     y = []
-                    with torch.no_grad():
-                        x, y = inference(model, input_image, y, 0, save_set)
+                    with self._ft.work("inference"):
+                        with torch.no_grad():
+                            x, y = inference(model, input_image, y, 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
-                    results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
-                    map_results = None if self._batch_past_gt(batch_id, batch_size) else \
-                        postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                    self._update_map(results, batch_id, batch_size, map_results=map_results)
+                    with self._ft.work("postprocess"):
+                        results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
+                        map_results = None if self._batch_past_gt(batch_id, batch_size) else \
+                            postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                        self._update_map(results, batch_id, batch_size, map_results=map_results)
 
                     _send_start = time.perf_counter()
-                    payload = {
-                        "width": width,
-                        "height": height,
-                        "results": [
-                            {
-                                "boxes":   r["boxes"].cpu().numpy(),
-                                "scores":  r["scores"].cpu().numpy(),
-                                "classes": r["classes"].cpu().numpy(),
-                            }
-                            for r in results
-                        ],
-                        "edge_start_time": edge_start_wall,
-                    }
-                    body = pickle.dumps({"action": "OUTPUT", "data": payload})
-                    self.size_message = len(body)
-                    self.channel.basic_publish(exchange='', routing_key=self.intermediate_queue, body=body)
+                    with self._ft.work("send"):
+                        payload = {
+                            "width": width,
+                            "height": height,
+                            "results": [
+                                {
+                                    "boxes":   r["boxes"].cpu().numpy(),
+                                    "scores":  r["scores"].cpu().numpy(),
+                                    "classes": r["classes"].cpu().numpy(),
+                                }
+                                for r in results
+                            ],
+                            "edge_start_time": edge_start_wall,
+                        }
+                        body = pickle.dumps({"action": "OUTPUT", "data": payload})
+                        self.size_message = len(body)
+                        self.channel.basic_publish(exchange='', routing_key=self.intermediate_queue, body=body)
                     send_ms = (time.perf_counter() - _send_start) * 1000
 
                 # ===== SPLIT INFERENCE =====
@@ -745,9 +829,10 @@ class Scheduler:
 
                     _inf_start = time.perf_counter()
                     y = []
-                    with torch.no_grad():
-                        x, y = inference(sub_model, input_image, y, 0, save_set)
-                    y[-1] = x
+                    with self._ft.work("inference"):
+                        with torch.no_grad():
+                            x, y = inference(sub_model, input_image, y, 0, save_set)
+                        y[-1] = x
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
                     y = {
@@ -777,6 +862,7 @@ class Scheduler:
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = 0.0
                 _ram_start = time.perf_counter()
+                _ft_metrics = self._ft.now()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
                 msg_size = self.size_message if self.size_message is not None else 0
@@ -795,6 +881,7 @@ class Scheduler:
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_wall,
                 )
+                self._ft.add_work("metrics", _ft_metrics)
                 # write_ms = (time.perf_counter() - _write_start) * 1000
 
                 # batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
@@ -809,7 +896,8 @@ class Scheduler:
                 # only_edge: the edge completes the batch here, so it emits the DONE
                 # (in split/only_cloud the cloud does it instead — never both).
                 if mode == "only_edge":
-                    self._send_fps_done()
+                    with self._ft.work("send"):
+                        self._send_fps_done()
 
                 batch_id += 1
                 prev_batch_end = batch_end
@@ -819,6 +907,7 @@ class Scheduler:
             else:
                 continue
         self._mark_edge("end")
+        self._ft.stop()
         print(f'size message: {self.size_message} bytes.')
         cap.release()
         pbar.close()
@@ -833,6 +922,7 @@ class Scheduler:
         # logged by both callers, and the report must go out BEFORE NOTIFY so it
         # is on the broker when the server starts its shutdown sequence.
         self._send_utilization(self._compute_utilization(self._timing_events_edge, "edge"))
+        self._send_free_time("edge")
         # only_edge: this device ran postprocess_yolo itself (_map_updated flags
         # that _update_map ran), so it — not a cloud — owns the mAP report.
         if self._map_updated:
@@ -883,7 +973,12 @@ class Scheduler:
         prev_batch_end = None
         self.channel.queue_declare(self.fps_queue, durable=False)
         self._mark_cloud("start")
+        self._ft.start()
         while True:
+            # Classified after the fact: the same basic_get is 'recv' work when a
+            # batch comes back and free time when the queue is empty, and only
+            # the return value says which.
+            _ft_get = self._ft.now()
             method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
             if method_frame and body:
                 t_batch_ready = time.perf_counter()
@@ -892,6 +987,7 @@ class Scheduler:
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
+                self._ft.add_work("recv", _ft_get)
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
                 # Prefer the edge's own batch_id (rides in the message) over this
@@ -907,37 +1003,41 @@ class Scheduler:
                 # ===== ONLY CLOUD =====
                 elif mode == "only_cloud":
                     _decode_start = time.perf_counter()
-                    input_tensor = y["data"]
+                    with self._ft.work("tensor"):
+                        input_tensor = y["data"]
 
-                    if isinstance(input_tensor, list):
-                        input_tensor = torch.stack(input_tensor)
+                        if isinstance(input_tensor, list):
+                            input_tensor = torch.stack(input_tensor)
 
-                    input_tensor = input_tensor.to(self.device)
+                        input_tensor = input_tensor.to(self.device)
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
 
                     _inf_start = time.perf_counter()
-                    with torch.no_grad():
-                        x, _ = inference(model, input_tensor, [], 0, save_set)
+                    with self._ft.work("inference"):
+                        with torch.no_grad():
+                            x, _ = inference(model, input_tensor, [], 0, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
                 # ===== SPLIT INFERENCE =====
                 else:
                     _decode_start = time.perf_counter()
-                    if compress["enable"]:
-                        y["data"] = Decoder(y["data"], y["shape"])
+                    with self._ft.work("decompress"):
+                        if compress["enable"]:
+                            y["data"] = Decoder(y["data"], y["shape"])
 
+                            y["data"] = [
+                                torch.from_numpy(t) if t is not None else None
+                                for t in y["data"]
+                            ]
+
+                    with self._ft.work("tensor"):
                         y["data"] = [
-                            torch.from_numpy(t) if t is not None else None
+                            t.to(self.device) if t is not None else None
                             for t in y["data"]
                         ]
 
-                    y["data"] = [
-                        t.to(self.device) if t is not None else None
-                        for t in y["data"]
-                    ]
+                        list_output = y["data"]
 
-                    list_output = y["data"]
-
-                    x = list_output[-1]
+                        x = list_output[-1]
                     decode_ms = (time.perf_counter() - _decode_start) * 1000
 
                     if self.adaptive_on:
@@ -951,18 +1051,20 @@ class Scheduler:
                         sub_model = model            # already sliced at load time
 
                     _inf_start = time.perf_counter()
-                    with torch.no_grad():
-                        x, _ = inference(sub_model, x, list_output, cut, save_set)
+                    with self._ft.work("inference"):
+                        with torch.no_grad():
+                            x, _ = inference(sub_model, x, list_output, cut, save_set)
                     inference_ms = (time.perf_counter() - _inf_start) * 1000
 
                 if mode == "only_edge":
                     postprocess_ms = 0.0
                 else:
                     _post_start = time.perf_counter()
-                    results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
-                    map_results = None if self._batch_past_gt(msg_batch_id, batch_size) else \
-                        postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                    self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
+                    with self._ft.work("postprocess"):
+                        results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
+                        map_results = None if self._batch_past_gt(msg_batch_id, batch_size) else \
+                            postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                        self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
                     postprocess_ms = (time.perf_counter() - _post_start) * 1000
 
                 batch_end = time.perf_counter()
@@ -972,6 +1074,7 @@ class Scheduler:
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
                 _ram_start = time.perf_counter()
+                _ft_metrics = self._ft.now()
                 ram_mb = self.get_ram_mb()
                 ram_ms = (time.perf_counter() - _ram_start) * 1000
 
@@ -989,6 +1092,7 @@ class Scheduler:
                     e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_time,
                 )
+                self._ft.add_work("metrics", _ft_metrics)
                 # write_ms = (time.perf_counter() - _write_start) * 1000
 
                 # batch_interval_ms = (batch_end - prev_batch_end) * 1000 if prev_batch_end is not None else 0.0
@@ -1003,7 +1107,8 @@ class Scheduler:
                 # One DONE per completed batch. In only_edge the EDGE completes the
                 # batch and sends DONE, so the cloud must not (avoid double count).
                 if mode != "only_edge":
-                    self._send_fps_done()
+                    with self._ft.work("send"):
+                        self._send_fps_done()
 
                 batch_id += 1
                 prev_batch_end = batch_end
@@ -1016,16 +1121,22 @@ class Scheduler:
                 if body:
                     received_data = pickle.loads(body)
                     Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
+                    self._ft.add_wait("input", _ft_get)
                     if received_data["action"] == "STOP":
                         Log.print_with_color("[>>>] Finish!", "red")
                         break
                 else:
                     time.sleep(0.5)
+                    # Nothing on either queue: the empty get, the control poll and
+                    # the sleep are all one uninterrupted stretch of doing nothing.
+                    self._ft.add_wait("input", _ft_get)
 
         self._mark_cloud("end")
+        self._ft.stop()
         # Last step on this device: compute the whole-run ratio from the timing
         # events and park the report on utilization_queue for the server to collect.
         self._send_utilization(self._compute_utilization(self._timing_events_cloud, "cloud"))
+        self._send_free_time("cloud")
         if self._map_updated:
             self._send_pred_dir_to_server()
         try:
@@ -1098,6 +1209,7 @@ class Scheduler:
         in_q = _queue.Queue(maxsize=self.mt_queue_size)
         out_q = _queue.Queue(maxsize=self.mt_queue_size)
         self._mark_edge("start")
+        self._ft.start()
 
         infer_t = threading.Thread(
             target=self._edge_infer_worker,
@@ -1109,6 +1221,7 @@ class Scheduler:
         infer_t.join()
 
         self._mark_edge("end")
+        self._ft.stop()
         print(f'size message: {self.size_message} bytes.')
         cap.release()
         self._finish_edge()
@@ -1132,22 +1245,25 @@ class Scheduler:
                 # ---- INPUT: capture one frame, emit a batch when full ----
                 if not in_sentinel_sent:
                     if not video_done and len(frames) < batch_size:
-                        ret, frame = cap.read()
-                        if not ret:
-                            video_done = True
-                        else:
-                            # Stay uint8 here; _edge_infer_worker does .float()/255
-                            # after the H2D copy. Same arithmetic (an exact float32
-                            # division of the same integers, so the head model sees
-                            # bit-identical input and mAP is unchanged), but a
-                            # queued batch is 39MB instead of 157MB and the divide
-                            # runs on the inference device instead of stealing CPU
-                            # from the 9 edge processes sharing this host.
-                            frame = cv2.resize(frame, (640, 640))
-                            frames.append(torch.from_numpy(frame).permute(2, 0, 1))
+                        with self._ft.work("capture"):
+                            ret, frame = cap.read()
+                            if ret:
+                                # Stay uint8 here; _edge_infer_worker does .float()/255
+                                # after the H2D copy. Same arithmetic (an exact float32
+                                # division of the same integers, so the head model sees
+                                # bit-identical input and mAP is unchanged), but a
+                                # queued batch is 39MB instead of 157MB and the divide
+                                # runs on the inference device instead of stealing CPU
+                                # from the 9 edge processes sharing this host.
+                                frame = cv2.resize(frame, (640, 640))
+                                frames.append(torch.from_numpy(frame).permute(2, 0, 1))
+                        if ret:
                             progressed = True
+                        else:
+                            video_done = True
                     if len(frames) == batch_size:
-                        item = (time.perf_counter(), time.time(), torch.stack(frames))
+                        with self._ft.work("tensor"):
+                            item = (time.perf_counter(), time.time(), torch.stack(frames))
                         if self._mt_put_nowait(in_q, item):
                             frames = []
                             progressed = True
@@ -1171,7 +1287,11 @@ class Scheduler:
                     break   # safety valve: peer stopped abnormally, nothing left to drain
 
                 if not progressed:
-                    time.sleep(0.002)
+                    # Nothing to capture and nothing to publish: this lane is idle.
+                    # Recorded per poll, and the tracker coalesces consecutive polls
+                    # so a long stall stays one interval.
+                    with self._ft.wait("idle"):
+                        time.sleep(0.002)
         except Exception as e:
             Log.print_with_color(f"[edge-mt][transfer] {e!r}", "yellow")
             traceback.print_exc()
@@ -1205,6 +1325,7 @@ class Scheduler:
         out["_done"] = done
         latency_ms = (done - batch_start) * 1000
         fps = batch_size / (done - prev_done) if prev_done is not None else 0.0
+        _ft_metrics = self._ft.now()
         ram_mb = self.get_ram_mb()
         msg_size = self.size_message if self.size_message is not None else 0
 
@@ -1214,6 +1335,7 @@ class Scheduler:
             latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
             message_size_bytes=msg_size, e2e_latency_ms=0.0,
             edge_start_time=edge_start_wall)
+        self._ft.add_work("metrics", _ft_metrics)
         # Log.print_with_color(
         #     f"[Timing][edge-mt] infer={inference_ms:.1f}ms send={send_ms:.1f}ms "
         #     f"latency={latency_ms:.1f}ms cut={edge_best_cut}", "magenta")
@@ -1223,7 +1345,11 @@ class Scheduler:
         """Pure compute thread: batch (CPU) -> H2D -> head model -> D2H -> out_q."""
         try:
             while True:
+                # Blocked here is this device being STARVED by the capture/
+                # transfer thread: the lane is doing nothing, so it is free time.
+                _ft_w = self._ft.now()
                 item = self._mt_get(in_q)
+                self._ft.add_wait("input", _ft_w)
                 if item is None:
                     break
                 # Utilization markers live on THIS thread: it is the only stage
@@ -1236,7 +1362,8 @@ class Scheduler:
                 # queues (and the H2D copy) 4x smaller; normalise here, on the
                 # inference device. float()/255.0 on the same integers is exactly
                 # what the old CPU-side astype('float32')/255.0 produced.
-                x_in = x_in.to(self.device).float().div_(255.0)
+                with self._ft.work("tensor"):
+                    x_in = x_in.to(self.device).float().div_(255.0)
 
                 if self.adaptive_on:
                     cut = self.current_cut
@@ -1247,11 +1374,13 @@ class Scheduler:
 
                 _inf = time.perf_counter()
                 y = []
-                with torch.no_grad():
-                    x, y = inference(sub_model, x_in, y, 0, save_set)
-                y[-1] = x
+                with self._ft.work("inference"):
+                    with torch.no_grad():
+                        x, y = inference(sub_model, x_in, y, 0, save_set)
+                    y[-1] = x
                 # Move to CPU here so the transfer thread does no GPU work.
-                y = [(t.detach().cpu() if isinstance(t, torch.Tensor) else None) for t in y]
+                with self._ft.work("tensor"):
+                    y = [(t.detach().cpu() if isinstance(t, torch.Tensor) else None) for t in y]
                 inference_ms = (time.perf_counter() - _inf) * 1000
 
                 payload = {"data": y, "width": width, "height": height,
@@ -1261,7 +1390,12 @@ class Scheduler:
 
                 out = {"batch_start": batch_start, "edge_start_wall": edge_start_wall,
                        "inference_ms": inference_ms, "cut": cut, "payload": payload}
-                if not self._mt_put(out_q, out):
+                # Blocking on a full out_q is the transfer stage back-pressuring
+                # this one — this lane is doing nothing while it waits.
+                _ft_dn = self._ft.now()
+                put_ok = self._mt_put(out_q, out)
+                self._ft.add_wait("downstream", _ft_dn)
+                if not put_ok:
                     break
                 # Blocking on a full out_q (slow network) counts as busy —
                 # occupancy, same as the sequential path's send/queue_wait time.
@@ -1284,6 +1418,7 @@ class Scheduler:
         self.channel.queue_declare(self.fps_queue, durable=False)
         self._fps_q = _queue.Queue()   # infer thread -> recv thread: fps 'done' pings
         self._mark_cloud("start")
+        self._ft.start()
 
         infer_t = threading.Thread(
             target=self._cloud_infer_worker,
@@ -1296,10 +1431,12 @@ class Scheduler:
         self._drain_fps_events()   # flush DONEs for the final in-flight batches
 
         self._mark_cloud("end")
+        self._ft.stop()
         # Last step on this device: compute the whole-run ratio from the timing
         # events and park the report on utilization_queue for the server to collect.
         # (Runs on the recv/main thread, which owns the pika channel.)
         self._send_utilization(self._compute_utilization(self._timing_events_cloud, "cloud"))
+        self._send_free_time("cloud")
         if self._map_updated:
             self._send_pred_dir_to_server()
 
@@ -1307,13 +1444,19 @@ class Scheduler:
         try:
             while True:
                 # Publish fps 'done' pings for batches the infer thread finished
-                # (done here because this thread owns the pika channel).
-                self._drain_fps_events()
+                # (done here because this thread owns the pika channel). Timed on
+                # its own so the publish is never folded into the free-time window
+                # the empty-queue branch below opens.
+                _ft_drain = self._ft.now()
+                if self._drain_fps_events():
+                    self._ft.add_work("send", _ft_drain)
+                _ft_get = self._ft.now()
                 method_frame, header_frame, body = self.channel.basic_get(
                     queue=self.intermediate_queue, auto_ack=True)
                 if method_frame and body:
                     received_message_size = len(body)
                     received_data = pickle.loads(body)
+                    self._ft.add_work("recv", _ft_get)
                     y = received_data["data"]
                     edge_start_time = y.get("edge_start_time", time.time())
                     if self.adaptive_on:
@@ -1322,14 +1465,20 @@ class Scheduler:
                         cut = splits
 
                     _dec = time.perf_counter()
-                    if compress["enable"]:
-                        y["data"] = Decoder(y["data"], y["shape"])
-                        y["data"] = [torch.from_numpy(t) if t is not None else None
-                                     for t in y["data"]]
+                    with self._ft.work("decompress"):
+                        if compress["enable"]:
+                            y["data"] = Decoder(y["data"], y["shape"])
+                            y["data"] = [torch.from_numpy(t) if t is not None else None
+                                         for t in y["data"]]
                     # Leave tensors on CPU; inference thread does the H2D copy.
                     decode_ms = (time.perf_counter() - _dec) * 1000
 
-                    if not self._mt_put(local_q, (received_message_size, y, edge_start_time, cut, decode_ms)):
+                    # A full local_q means the inference thread is behind; this
+                    # lane has nothing to do until it catches up.
+                    _ft_dn = self._ft.now()
+                    put_ok = self._mt_put(local_q, (received_message_size, y, edge_start_time, cut, decode_ms))
+                    self._ft.add_wait("downstream", _ft_dn)
+                    if not put_ok:
                         break
                 else:
                     m2, h2, b2 = self.channel.basic_get(
@@ -1337,11 +1486,15 @@ class Scheduler:
                     if b2:
                         rd = pickle.loads(b2)
                         Log.print_with_color(f"[<<<] Received message from server {rd}", "blue")
+                        self._ft.add_wait("input", _ft_get)
                         if rd.get("action") == "STOP":
                             Log.print_with_color("[>>>] Finish!", "red")
                             break
                     else:
                         time.sleep(0.5)
+                        # Empty work queue, empty control queue, then the sleep:
+                        # one uninterrupted stretch of this lane doing nothing.
+                        self._ft.add_wait("input", _ft_get)
         except Exception as e:
             Log.print_with_color(f"[cloud-mt][recv] {e!r}", "yellow")
             traceback.print_exc()
@@ -1355,7 +1508,11 @@ class Scheduler:
         prev_done = None
         try:
             while True:
+                # Blocked here == starved by the recv thread (which is itself
+                # blocked downloading): this lane is idle, so it is free time.
+                _ft_w = self._ft.now()
                 item = self._mt_get(local_q)
+                self._ft.add_wait("input", _ft_w)
                 if item is None:
                     break
                 # Utilization markers live on THIS thread: it is the only stage
@@ -1370,9 +1527,10 @@ class Scheduler:
                 # loop's local receive-order counter, so frame_num stays correct
                 # even if arrival order ever diverges from send order.
                 msg_batch_id = y.get("batch_id", batch_id)
-                y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
-                list_output = y["data"]
-                x = list_output[-1]
+                with self._ft.work("tensor"):
+                    y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
+                    list_output = y["data"]
+                    x = list_output[-1]
 
                 if self.adaptive_on:
                     use_cut = cut
@@ -1383,13 +1541,15 @@ class Scheduler:
                     sub_model = model
                     cloud_best_cut = "N/A" if splits is None else splits
 
-                with torch.no_grad():
-                    x, _ = inference(sub_model, x, list_output, use_cut, save_set)
+                with self._ft.work("inference"):
+                    with torch.no_grad():
+                        x, _ = inference(sub_model, x, list_output, use_cut, save_set)
 
-                results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
-                map_results = None if self._batch_past_gt(msg_batch_id, batch_size) else \
-                    postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
-                self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
+                with self._ft.work("postprocess"):
+                    results = postprocess_yolo(x, conf_thres=0.25, iou_thres=0.5)
+                    map_results = None if self._batch_past_gt(msg_batch_id, batch_size) else \
+                        postprocess_yolo(x, conf_thres=0.001, iou_thres=0.5)
+                    self._update_map(results, msg_batch_id, batch_size, map_results=map_results)
                 # Same point as the sequential path: right after postprocess,
                 # before the metrics bookkeeping.
                 self._mark_cloud("output")
@@ -1399,6 +1559,7 @@ class Scheduler:
                 latency_ms = (done - t0) * 1000
                 fps = batch_size / (done - prev_done) if prev_done is not None else 0.0
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
+                _ft_metrics = self._ft.now()
                 ram_mb = self.get_ram_mb()
 
                 self.write_metrics(
@@ -1407,6 +1568,7 @@ class Scheduler:
                     latency_ms=latency_ms, fps=fps, ram_mb=ram_mb,
                     message_size_bytes=received_message_size,
                     e2e_latency_ms=e2e_latency_ms, edge_start_time=edge_start_time)
+                self._ft.add_work("metrics", _ft_metrics)
                 # Log.print_with_color(
                 #     f"[Timing][cloud-mt] decode={decode_ms:.1f}ms infer+post={latency_ms:.1f}ms "
                 #     f"e2e={e2e_latency_ms:.1f}ms cut={cloud_best_cut}", "magenta")
@@ -1608,7 +1770,10 @@ class Scheduler:
     def _poll_ctrl(self):
         """Edge: drain SET_CUT control messages from the server, applying the
         latest requested cut (clamped to [1, L-1])."""
-        method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
+        # A broker round trip per batch — small, but it is work this device does,
+        # so it belongs in busy rather than silently inflating free time.
+        with self._ft.work("recv"):
+            method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
         while body:
             try:
                 msg = pickle.loads(body)
@@ -1622,12 +1787,26 @@ class Scheduler:
                 pass
             method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None, map_cfg=None):
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None, map_cfg=None, free_time=None):
         adaptive = adaptive or {}
         multithreading = multithreading or {}
         backpressure = backpressure or {}
         detections = detections or {}
         map_cfg = map_cfg or {}
+        free_time = free_time or {}
+        # Free-time accounting adds one interval record per work stage per batch
+        # (plus one per captured frame), so it is off the hot path by construction
+        # — but it stays configurable because it is telemetry, and telemetry
+        # should never be the reason a measurement run can't be reproduced.
+        # `or` on bucket_s, not a get() default: this config file leaves keys
+        # blank on purpose to mean 'use the default', and a blank YAML value
+        # arrives as None, which float() would reject.
+        self._ft = FreeTimeTracker(
+            enable=free_time.get("enable", True) is not False,
+            bucket_s=float(free_time.get("bucket_s") or 1.0),
+        )
+        if not self._ft.enable:
+            Log.print_with_color("[FreeTime] disabled (free_time.enable=False)", "yellow")
         self.adaptive_on = bool(adaptive.get("enable", False)) and mode == "split"
         self.mt_on = bool(multithreading.get("enable", False)) and mode == "split"
         self.mt_queue_size = int(multithreading.get("queue_size", 4))

@@ -74,6 +74,24 @@ detections:
                           # False cũng tắt luôn việc ghi detections_stream.jsonl trong lúc chạy
                           # (1 lần open+write+close MỖI FRAME, nằm trong khoảng đo busy).
 
+free_time:                # THỜI GIAN RẢNH của từng device/máy: khoảng wall-clock KHÔNG làm gì cả
+  enable: True            # (không inference, không gửi, không nén, không giải nén, không postprocess).
+                          # Mỗi device gộp (UNION) các khoảng bận của TẤT CẢ luồng của nó rồi lấy
+                          # phần còn lại — cộng dồn thì sai, vì 2 luồng pipeline chạy song song và
+                          # tổng có thể vượt quá thời gian thực.
+                          #   · device tự ghi free_time_<role>_<cluster>_<id>.log (có cả series theo
+                          #     bucket để vẽ), rồi gửi report về freetime_queue;
+                          #   · server gom lúc shutdown → free_time.log (mỗi device 1 dòng),
+                          #     free_time_cluster.log (theo cluster / role / MÁY / SYSTEM),
+                          #     free_time_series.log (mỗi device mỗi bucket 1 dòng, để vẽ heat-map).
+                          # KHÁC với utilization.log: utilization đo busy/total trong cửa sổ
+                          # get_input→output của MỘT luồng (nên thời gian chờ bên trong cửa sổ đó bị
+                          # tính là bận, và việc luồng kia làm thì không được tính). free% và
+                          # utilization% KHÔNG cộng lại thành 100%.
+  bucket_s: 1.0           # độ rộng bucket của chuỗi free-time (giây). Run dài thì bucket tự nới ra
+                          # để không bao giờ gửi quá 3600 điểm mỗi device.
+  collect_timeout_s: 30   # thời gian chờ tối đa để gom đủ report từ các device
+
 map:                      # 2 pipeline mAP chạy ở Server lúc shutdown (ground truth = map/label/)
   enable: True            # False = TẮT toàn bộ mAP per-batch trên device. Mỗi batch hiện phải trả:
                           #   - 1 pass postprocess_yolo thứ hai ở conf=0.001 (ngưỡng này giữ gần như

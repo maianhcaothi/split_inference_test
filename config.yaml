@@ -30,7 +30,7 @@ clustering:
   num_C: 3
   num_cloud: 3         # = clients[1] (tổng cloud)
   max_clusters: 3      # <= min(clients[0], clients[1])
-  network_rate_mb_s: 100.0  # MB/s egress MỖI edge (không phải tổng đường truyền!). Solver cộng
+  network_rate_mb_s: 60  # MB/s egress MỖI edge (không phải tổng đường truyền!). Solver cộng
                           # 1/tau của từng edge (Clustering.pair_metrics_for_cut) nên nó cần phần
                           # băng thông riêng của mỗi edge. Với 9 edge chung 1 NIC, đặt ~ (tốc độ
                           # đường truyền) / 9. KHÔNG có chỗ nào trong thuật toán chia cho số edge.

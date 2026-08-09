@@ -30,7 +30,7 @@ clustering:
   num_C: 3
   num_cloud: 3         # = clients[1] (tổng cloud)
   max_clusters: 3      # <= min(clients[0], clients[1])
-  network_rate_mb_s: 60  # MB/s egress MỖI edge (không phải tổng đường truyền!). Solver cộng
+  network_rate_mb_s: 9  # MB/s egress MỖI edge (không phải tổng đường truyền!). Solver cộng
                           # 1/tau của từng edge (Clustering.pair_metrics_for_cut) nên nó cần phần
                           # băng thông riêng của mỗi edge. Với 9 edge chung 1 NIC, đặt ~ (tốc độ
                           # đường truyền) / 9. KHÔNG có chỗ nào trong thuật toán chia cho số edge.
@@ -102,6 +102,27 @@ free_time:                # THỜI GIAN RẢNH của từng device/máy: khoản
   bucket_s: 1.0           # độ rộng bucket của chuỗi free-time (giây). Run dài thì bucket tự nới ra
                           # để không bao giờ gửi quá 3600 điểm mỗi device.
   collect_timeout_s: 30   # thời gian chờ tối đa để gom đủ report từ các device
+
+broker_ram:               # RAM của MÁY CHẠY QUEUE (RabbitMQ), do SERVER đo từ đầu đến cuối run.
+  enable: True            # Không có process nào của mình chạy trên máy đó, nên server kéo số liệu
+                          # từ xa qua SSH: 1 phiên SSH duy nhất chạy vòng lặp đọc /proc/meminfo trên
+                          # máy queue (KHÔNG phải mỗi mẫu một lần SSH — như vậy là bắt chính cái máy
+                          # đang đo phải bắt tay TCP + auth mỗi giây).
+                          #   · broker_ram_ns.log  — mỗi mẫu 1 dòng (chuỗi để vẽ)
+                          #   · broker_ram.log     — tổng kết cả run (min/mean/p95/max, growth, peak)
+                          # Vì sao cần: mọi feature map trung gian đều đi qua máy này. Batch 32 chưa
+                          # nén ~39MB/message, queue sâu 10 message là ~400MB nằm trong RAM broker.
+                          # Khi chạm high-water mark RabbitMQ CHẶN publisher — trên device chỉ thấy
+                          # đứng hình, free time đổ vào 'backpressure'/'downstream' mà bản thân device
+                          # không có gì sai. Đường RAM của broker là thứ phân biệt 2 trường hợp đó.
+  host: ""                # bỏ trống = dùng rabbit.address
+  user: ""                # TÀI KHOẢN SSH của máy queue (KHÁC rabbit.username/password ở trên —
+  password: ""            # cái đó là credential AMQP, không mở được shell)
+  ssh_port: 22
+  interval_s: 1.0         # chu kỳ lấy mẫu (giây)
+  api_port: 15672         # chỉ dùng cho fallback: nếu SSH không mở được, server chuyển sang management
+                          # API. Khi đó used_mb là RAM CỦA TIẾN TRÌNH BROKER, không phải RAM của máy —
+                          # log ghi rõ source=rabbitmq_api để không nhầm.
 
 map:                      # 2 pipeline mAP chạy ở Server lúc shutdown (ground truth = map/label/)
   enable: True            # False = TẮT toàn bộ mAP per-batch trên device. Mỗi batch hiện phải trả:

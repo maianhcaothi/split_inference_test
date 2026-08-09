@@ -34,7 +34,7 @@ clustering:
                           # 1/tau của từng edge (Clustering.pair_metrics_for_cut) nên nó cần phần
                           # băng thông riêng của mỗi edge. Với 9 edge chung 1 NIC, đặt ~ (tốc độ
                           # đường truyền) / 9. KHÔNG có chỗ nào trong thuật toán chia cho số edge.
-  measure_bandwidth: True # True → mỗi client tự đo egress lúc đăng ký; False → dùng network_rate_mb_s.
+  measure_bandwidth: False # True → mỗi client tự đo egress lúc đăng ký; False → dùng network_rate_mb_s.
                           # Lưu ý: phép đo chỉ đúng khi 9 edge đo ĐỒNG THỜI (lúc đó contention đã
                           # nằm trong số đo, và không cần chia thêm). Client đo ngay sau bước
                           # profiling, nên nếu máy nào cache profile miss thì nó lệch pha và đo được

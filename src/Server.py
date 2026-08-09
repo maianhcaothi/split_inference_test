@@ -152,6 +152,7 @@ class Server:
         self.detections_cfg = config.get("detections", {})
         self.map_cfg = config.get("map", {})
         self.free_time_cfg = config.get("free_time", {})
+        self.broker_ram_cfg = config.get("broker_ram", {})
         self.cluster_state = {}       # {queue_name: {"queue", "cut", "edges": [client_id,...]}}
         self._num_layers = None       # L, total model layers (for clamping the cut)
         self._adaptive_thread = None
@@ -305,6 +306,16 @@ class Server:
         self.free_time_series_log_path = f"{log_path}/free_time_series.log"
         open(self.free_time_series_log_path, "w").close()
         self._server_cpu0 = None   # host idle sample for the server's own machine
+        # ── RAM of the queue host (the machine running RabbitMQ) ──
+        # Nothing of ours runs on that box, so the server pulls its memory from
+        # outside over SSH for the whole run — see src/BrokerRam.py. One line per
+        # sample in the _ns file (the plottable series), one summary block in the
+        # other. Both truncated here like every other result file.
+        self.broker_ram_ns_log_path = f"{log_path}/broker_ram_ns.log"
+        open(self.broker_ram_ns_log_path, "w").close()
+        self.broker_ram_log_path = f"{log_path}/broker_ram.log"
+        open(self.broker_ram_log_path, "w").close()
+        self._broker_ram = self._make_broker_ram_monitor()
         # mAP summary: two lines per cluster (WINDOW = pipeline 1, ALL = pipeline 2)
         # plus one OVERALL line per pipeline, appended by _collect_map_pred at
         # shutdown. Truncated here so runs never mix.
@@ -837,6 +848,15 @@ class Server:
         from src.FreeTime import (WORK_KINDS, merge_intervals, subtract_intervals,
                                   clip_intervals, total_ns)
 
+        # Same contract as _collect_map_pred: free_time.enable travels to the
+        # devices in START, so when it is off nobody will ever publish here and
+        # waiting the full timeout only delays the shutdown.
+        if self.free_time_cfg.get("enable", True) is False:
+            src.Log.print_with_color(
+                "[FreeTime] skipped (free_time.enable=False) — devices ran without "
+                "free-time accounting", "yellow")
+            return
+
         if timeout_s is None:
             timeout_s = float(self.free_time_cfg.get("collect_timeout_s") or 30.0)
         expected = len(self.registered_ids)
@@ -1015,6 +1035,100 @@ class Server:
                     f.write("\n".join(out) + "\n")
             except Exception as e:
                 src.Log.print_with_color(f"[FreeTime] log write failed ({path}): {e}", "yellow")
+
+    def _make_broker_ram_monitor(self):
+        """Build (but don't start) the queue-host RAM sampler.
+
+        Defaults to the broker this run actually uses, so a config that only
+        flips `enable` still measures the right machine. The SSH credentials are
+        the HOST login of that machine — deliberately separate from the
+        rabbit.username/password above, which are AMQP credentials and cannot
+        open a shell.
+
+        Returns None rather than raising: this runs in __init__, and a telemetry
+        module that fails to import must not stop the server from starting."""
+        try:
+            from src.BrokerRam import BrokerRamMonitor
+        except Exception as e:
+            src.Log.print_with_color(f"[BrokerRAM] disabled — {e}", "yellow")
+            return None
+        cfg = self.broker_ram_cfg or {}
+        return BrokerRamMonitor(
+            host=cfg.get("host") or self.address,
+            user=cfg.get("user"),
+            password=cfg.get("password"),
+            port=cfg.get("ssh_port") or 22,
+            interval_s=cfg.get("interval_s") or 1.0,
+            ns_log_path=self.broker_ram_ns_log_path,
+            enable=cfg.get("enable", False) is not False,
+            api_port=cfg.get("api_port") or 15672,
+            api_user=self.username,
+            api_password=self.password,
+            api_vhost=self.virtual_host,
+        )
+
+    def _start_broker_ram(self):
+        """Begin sampling the queue host. Called at the START fan-out so the
+        first sample is the broker's baseline with every queue still empty —
+        which is what makes `growth_mb` in the summary mean 'RAM this run
+        added'. Never fatal: a telemetry channel that can't open must not stop a
+        run from happening."""
+        m = self._broker_ram
+        if m is None or not m.enable:
+            return
+        try:
+            ok = m.start()
+        except Exception as e:
+            src.Log.print_with_color(f"[BrokerRAM] sampler failed to start: {e}", "yellow")
+            return
+        if ok and m.source == "ssh":
+            src.Log.print_with_color(
+                f"[BrokerRAM] sampling {m.host} host RAM every {m.interval_s:.1f}s "
+                f"-> {self.broker_ram_ns_log_path}", "cyan")
+        elif ok:
+            src.Log.print_with_color(
+                f"[BrokerRAM] SSH unavailable ({m.error}); falling back to the "
+                f"management API — 'used' is then the BROKER PROCESS's memory, "
+                f"not {m.host}'s host RAM", "yellow")
+        else:
+            src.Log.print_with_color(
+                f"[BrokerRAM] no RAM samples from {m.host}: {m.error}", "yellow")
+
+    def _report_broker_ram(self):
+        """Shutdown step: stop sampling and write broker_ram.log.
+
+        Runs after every other collection, so the window covers the run AND the
+        shutdown drain — the drain is exactly when a backed-up broker gives its
+        memory back, and a curve that doesn't fall there is the signal that
+        something is still holding messages."""
+        m = self._broker_ram
+        if m is None or not m.enable:
+            return
+        try:
+            m.stop()
+            s = m.write_summary(self.broker_ram_log_path)
+        except Exception as e:
+            src.Log.print_with_color(f"[BrokerRAM] report failed: {e}", "yellow")
+            return
+        if s is None:
+            src.Log.print_with_color(
+                f"[BrokerRAM] no samples collected: {m.error or 'unknown reason'}", "yellow")
+            return
+        host_ram = s["source"] == "ssh"
+        print("=" * 60)
+        print(f"  [QUEUE HOST RAM]  {s['host']}   "
+              f"{'host memory (/proc/meminfo)' if host_ram else 'BROKER PROCESS only (management API)'}")
+        print(f"  samples={s['samples']}  every {s['interval_s']:.1f}s  "
+              f"over {s['span_s']:.1f}s"
+              + (f"   total={s['total_mb']:.0f} MB" if host_ram else ""))
+        print(f"  used   mean={s['used']['mean']:8.1f} MB   p95={s['used']['p95']:8.1f}   "
+              f"max={s['used']['max']:8.1f}   ({s['used_pct']['max']:.1f}% at peak)")
+        print(f"  delta  start={s['start_mb']:.1f} MB -> end={s['end_mb']:.1f} MB   "
+              f"growth={s['growth_mb']:+.1f} MB   peak over start={s['peak_over_start_mb']:+.1f} MB")
+        if host_ram:
+            print(f"  rabbitmq process  mean={s['rss']['mean']:.1f} MB   "
+                  f"max={s['rss']['max']:.1f} MB   swap_max={s['swap_max_mb']:.1f} MB")
+        print("=" * 60)
 
     def _server_host_idle_pct(self):
         """OS-level idle share of the server's own machine over the run."""
@@ -1268,6 +1382,17 @@ class Server:
         import io
         import shutil
 
+        # map.enable is a SERVER-side switch that reaches the devices in the START
+        # message, so the devices already know not to produce pred files. This
+        # collection has to honour the same flag or it polls an empty queue for the
+        # whole timeout and then warns '0/N pred report(s)' — a 30s stall plus a
+        # scary message on every run that deliberately turned mAP off.
+        # Same default as Scheduler.map_on, so the two can't disagree.
+        if not bool(self.map_cfg.get("enable", True)):
+            src.Log.print_with_color(
+                "[mAP] skipped (map.enable=False) — no pred files were produced", "yellow")
+            return
+
         if timeout_s is None:
             timeout_s = float(self.map_cfg.get("collect_timeout_s", 30.0))
         if window_batches is None:
@@ -1412,6 +1537,8 @@ class Server:
             "free_time.log",
             "free_time_cluster.log",
             "free_time_series.log",
+            "broker_ram.log",
+            "broker_ram_ns.log",
             "cut_change_ns.log",
         )
         log_path = self.config["log-path"]
@@ -1515,6 +1642,9 @@ class Server:
         self._collect_utilization()
         self._collect_free_time()
         self._collect_map_pred()
+        # Last meter to close: it is the only one still sampling, and the drain
+        # above is part of what it is measuring.
+        self._report_broker_ram()
         # Every result file is final by here — snapshot them into one run folder.
         # Guarded so a filesystem problem in the archive can't leave the broker
         # connection open or skip the clean exit.
@@ -2156,6 +2286,13 @@ class Server:
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 
+                # Single quotes inside the f-string on purpose: nesting the same
+                # quote character only parses on Python 3.12+ (PEP 701), and the
+                # DAI server runs 3.10 — the double-quoted form made this whole
+                # module a SyntaxError there, so nothing could import Server at all.
+                print(f"QUEUE NAME {response['queue_name']}")
+                print(f"SPLIT POINT {response['splits']}")
+
             # t0 for SYSTEM FPS (frames / (START -> last DONE)) — captured right
             # after the START fan-out, so warm-up is included in the whole-run rate.
             self._fps_start_t = time.time()
@@ -2163,6 +2300,9 @@ class Server:
             # window matches the devices' run span as closely as it can.
             from src.FreeTime import host_cpu_times
             self._server_cpu0 = host_cpu_times()
+            # Same t0 again for the queue host's RAM, so its first sample is the
+            # broker's baseline before any batch has been published.
+            self._start_broker_ram()
 
             self._start_adaptive_controller()
         else:

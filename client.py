@@ -121,9 +121,14 @@ if __name__ == "__main__":
             from src.Profiler import profile_or_load
             ckpt = torch.load(f"{model_name}.pt", map_location=device, weights_only=False)
             model_obj = ckpt["model"].float().eval().to(device)
+            prof_cfg = config.get("profiling", {}) or {}
+            runs_by_name = prof_cfg.get("runs_by_name", {}) or {}
+            prof_runs = int(runs_by_name.get(args.name, prof_cfg.get("runs_default", 100)))
+            prof_warmup = int(prof_cfg.get("warmup", 10))
             layer_times = profile_or_load(
                 model_name, model_obj, device,
-                batch_size=config["server"]["batch-size"]
+                batch_size=config["server"]["batch-size"],
+                warmup=prof_warmup, runs=prof_runs
             ).tolist()
             del model_obj, ckpt
         except Exception as e:

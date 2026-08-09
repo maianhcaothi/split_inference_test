@@ -10,7 +10,8 @@ def profile_or_load(model_name: str, model, device: str,
                     batch_size: int = 4, warmup: int = 10, runs: int = 100):
     """
     Profile per-layer inference time of model on device.
-    Returns np.array of shape (n_layers,) — mean seconds per layer per batch.
+    Returns np.array of shape (n_layers,) — mean seconds per layer per batch,
+    averaged over the `runs` timed passes; the first `warmup` passes are discarded.
     Cache saved as profile_{model_name}_{device}_bs{batch_size}_fp32.npy next to
     client.py. The dtype is in the name on purpose: older caches were measured in
     half() while the pipeline runs float(), so they must not be reused — the new
@@ -45,6 +46,8 @@ def profile_or_load(model_name: str, model, device: str,
     end_events   = {}
     layer_times  = [[] for _ in range(n)]
     hooks = []
+    # Warmup passes are discarded: hooks only record while _recording["on"] is True.
+    _recording = {"on": False}
 
     for i in range(n):
         def _pre(idx):
@@ -64,7 +67,8 @@ def profile_or_load(model_name: str, model, device: str,
                     ev.record()
                     end_events[idx] = ev
                 else:
-                    layer_times[idx].append(time.perf_counter() - start_events[idx])
+                    if _recording["on"]:
+                        layer_times[idx].append(time.perf_counter() - start_events[idx])
             return fn
 
         hooks.append(layers[i].register_forward_pre_hook(_pre(i)))
@@ -77,20 +81,22 @@ def profile_or_load(model_name: str, model, device: str,
     # RELATIVE per-layer costs the Hungarian solver picks the cut from.
     dummy = torch.randn(batch_size, 3, 640, 640).to(device)
 
-    # Warmup + Benchmark
+    # Warmup (discarded) then benchmark: only the `runs` post-warmup passes count.
     with torch.no_grad():
-        for _ in range(warmup + runs):
+        for it in range(warmup + runs):
+            _recording["on"] = (it >= warmup)
             _profile_model(dummy)
             if is_cuda:
                 torch.cuda.synchronize()
-                for i in range(n):
-                    t_ms = start_events[i].elapsed_time(end_events[i])
-                    layer_times[i].append(t_ms / 1000.0)
+                if it >= warmup:
+                    for i in range(n):
+                        t_ms = start_events[i].elapsed_time(end_events[i])
+                        layer_times[i].append(t_ms / 1000.0)
 
     for h in hooks:
         h.remove()
 
-    # Average TẤT CẢ measurements (warmup + benchmark) — nhất quán với measure_time_layer.py
+    # Average the `runs` timed passes (warmup discarded).
     avg = np.array([
         np.mean(layer_times[i]) if layer_times[i] else 0.0
         for i in range(n)

@@ -42,6 +42,26 @@ clustering:
                           # báo khi > 3x. Muốn cut TÁI LẬP ĐƯỢC giữa các run thì đặt False.
   profile_source: real     # auto → dùng real nếu có, không thì simulated; real → ép dùng real; simulated → ép dùng giả lập
 
+profiling:                  # ĐO per-layer time của model (proxy cho GFLOPs) để feed vào clustering.
+  warmup: 10                # số lần chạy LÀM NÓNG trước khi đo (mọi máy). KHÔNG tính vào trung bình.
+  runs_default: 100         # số lần ĐO (sau warmup) khi --name không nằm trong runs_by_name.
+  runs_by_name:             # số lần đo theo TỪNG máy — scale theo vCPU (≈ 250 × số core).
+    machine-2: 500          #  2 vCPU
+    machine-3: 500          #  2 vCPU
+    machine-4: 500          #  2 vCPU
+    machine-5: 250          #  1 vCPU
+    machine-6: 250          #  1 vCPU
+    machine-7: 250          #  1 vCPU
+    machine-8: 1000         #  4 vCPU
+    machine-9: 1000         #  4 vCPU
+    machine-10: 1000        #  4 vCPU
+    device-1: 1000          #  4 vCPU
+    device-2: 1000          #  4 vCPU
+    device-3: 1000          #  4 vCPU
+  # Profile CHỈ chạy LẦN ĐẦU: nếu profile_{model}_{device}_bs{bs}_fp32.npy đã tồn tại thì
+  # NẠP CACHE, không đo lại (Profiler.profile_or_load kiểm tra os.path.exists trước). Đổi số
+  # lần đo ở đây KHÔNG tự xoá cache — phải xoá *_fp32.npy trên máy đó thì lần sau mới đo lại.
+
 multithreading:
   enable: True            # chỉ hoạt động ở mode: split. Mỗi device chạy 2 luồng pipeline.
   queue_size: 1           # số batch tối đa chờ giữa luồng inference và luồng transfer (mỗi device).

@@ -1,6 +1,7 @@
 import os
 import pika
 import uuid
+import socket
 import argparse
 import yaml
 
@@ -74,11 +75,13 @@ def _apply_torch_threads(cfg, layer_id, override):
 
 _apply_torch_threads(config, args.layer_id, args.threads)
 
-# Identify this client by its --name (e.g. machine-2) instead of a random uuid,
-# so every id-keyed artefact — reply/ctrl/mfq queues, metrics/free_time files,
-# and the server's cluster/utilization/free_time reports — reads as the machine
-# name. Falls back to a uuid only when --name is not given.
-client_id = args.name if args.name else uuid.uuid4()
+# Identify this client by its --name (e.g. machine-2); if --name is omitted, fall
+# back to the machine's hostname. The VMs are named machine-2 .. device-3, so this
+# is still the machine name, never a random uuid. This id keys every artefact —
+# reply/ctrl/mfq queues, metrics/free_time files, and the server's
+# cluster/utilization/free_time reports — so they all read as the machine name.
+machine_name = args.name if args.name else socket.gethostname()
+client_id = machine_name
 address = config["rabbit"]["address"]
 username = config["rabbit"]["username"]
 password = config["rabbit"]["password"]
@@ -127,7 +130,7 @@ if __name__ == "__main__":
             model_obj = ckpt["model"].float().eval().to(device)
             prof_cfg = config.get("profiling", {}) or {}
             runs_by_name = prof_cfg.get("runs_by_name", {}) or {}
-            prof_runs = int(runs_by_name.get(args.name, prof_cfg.get("runs_default", 100)))
+            prof_runs = int(runs_by_name.get(machine_name, prof_cfg.get("runs_default", 100)))
             prof_warmup = int(prof_cfg.get("warmup", 10))
             layer_times = profile_or_load(
                 model_name, model_obj, device,
@@ -156,10 +159,10 @@ if __name__ == "__main__":
 
     data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id,
             "message": "Hello from Client!", "layer_times": layer_times,
-            "bandwidth_mb_s": bandwidth_mb_s, "client_name": args.name}
-    scheduler = Scheduler(client_id, args.layer_id, channel, device, name=args.name)
+            "bandwidth_mb_s": bandwidth_mb_s, "client_name": machine_name}
+    scheduler = Scheduler(client_id, args.layer_id, channel, device, name=machine_name)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")
-    client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device, name=args.name)
+    client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device, name=machine_name)
     client.send_to_server(data)
     client.wait_response()

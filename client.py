@@ -74,7 +74,11 @@ def _apply_torch_threads(cfg, layer_id, override):
 
 _apply_torch_threads(config, args.layer_id, args.threads)
 
-client_id = uuid.uuid4()
+# Identify this client by its --name (e.g. machine-2) instead of a random uuid,
+# so every id-keyed artefact — reply/ctrl/mfq queues, metrics/free_time files,
+# and the server's cluster/utilization/free_time reports — reads as the machine
+# name. Falls back to a uuid only when --name is not given.
+client_id = args.name if args.name else uuid.uuid4()
 address = config["rabbit"]["address"]
 username = config["rabbit"]["username"]
 password = config["rabbit"]["password"]

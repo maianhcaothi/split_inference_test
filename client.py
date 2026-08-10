@@ -156,6 +156,6 @@ if __name__ == "__main__":
     scheduler = Scheduler(client_id, args.layer_id, channel, device, name=args.name)
     logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")
-    client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device)
+    client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device, name=args.name)
     client.send_to_server(data)
     client.wait_response()

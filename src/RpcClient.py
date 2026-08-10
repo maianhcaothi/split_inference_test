@@ -8,12 +8,13 @@ import src.Log as Log
 from src.Model import get_save_set
 
 class RpcClient:
-    def __init__(self, client_id, layer_id, channel, logger ,inference_func, device):
+    def __init__(self, client_id, layer_id, channel, logger ,inference_func, device, name=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.logger = logger
         self.inference_func = inference_func
         self.device = device
+        self.name = name
 
         self.channel = channel
         self.response = None
@@ -50,6 +51,16 @@ class RpcClient:
             detections = self.response.get("detections", {}) or {}
             map_cfg = self.response.get("map", {}) or {}
             free_time = self.response.get("free_time", {}) or {}
+
+            # Which cluster this client landed in. The server names each cluster's
+            # queue intermediate_queue_{k}, so the trailing number IS the cluster id.
+            role = "edge" if self.layer_id == 1 else "cloud"
+            cluster_tag = (queue_name.rsplit("_", 1)[-1]
+                           if queue_name.startswith("intermediate_queue_") else "n/a")
+            Log.print_with_color(
+                f"[Cluster] name={self.name or self.client_id} role={role} "
+                f"layer_id={self.layer_id} cluster={cluster_tag} "
+                f"queue={queue_name} splits={splits}", "cyan")
 
             if model is not None:
                 file_path = f'{model_name}.pt'

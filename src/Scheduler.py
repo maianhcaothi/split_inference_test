@@ -90,6 +90,22 @@ class Scheduler:
         self.freetime_queue = "freetime_queue"
         self.channel.queue_declare(self.freetime_queue, durable=False)
 
+        # Message size: how many bytes this device puts on the wire per published
+        # message, measured BEFORE basic_publish. Exactly ONE device measures it —
+        # the first client that registered at layer 1 — and it learns that from
+        # the server's START message (message_size.measure), never from its own
+        # config file. Every edge in a cluster publishes the same feature map from
+        # the same cut, so nine copies of the number cost nine times as much and
+        # say the same thing. The samples are appended to this device's own log as
+        # the run goes and shipped to the server at finish, exactly like free time.
+        self.msg_size_on = False
+        self.msg_size_max_samples = 5000
+        self._msg_sizes = []        # (t_ns, batch_id, nbytes) per published message
+        self._msg_size_fh = None    # local log handle, opened on the first sample
+        self._msg_size_ctx = {}     # compress/batch_size, for the server's summary
+        self.msgsize_queue = "msgsize_queue"
+        self.channel.queue_declare(self.msgsize_queue, durable=False)
+
         # Adaptive split-point (Mechanic 1). When on, the model is held whole and
         # the cut is applied per-batch; the edge follows SET_CUT from the server.
         self.adaptive_on = False
@@ -265,6 +281,105 @@ class Scheduler:
             Log.print_with_color(f"[Metrics] Fanout setup failed: {e}", "yellow")
             self._my_metrics_queue = None
 
+    def _msg_size_log_path(self):
+        return (f"message_size_{self._cluster_tag()}_"
+                f"{str(self.client_id).replace('-', '')[:12]}.log")
+
+    def _record_msg_size(self, nbytes, batch_id=None):
+        """Record one outgoing message's size, measured BEFORE it is published.
+
+        Before, not after, on purpose: the number that matters is what this device
+        hands the broker, and it must be known even if the publish then fails or
+        blocks — a message that stalls on a full broker is exactly the case the
+        measurement exists to explain (see the queue-host RAM curve, guide 11).
+
+        No-op on every device except the designated one, so the other edges pay
+        one attribute lookup per batch. The line is written to this device's own
+        log as the run goes, because the local file is the copy that survives a
+        broker or server problem; the same samples are shipped to the server at
+        finish for the fleet view.
+
+        Telemetry: every failure path degrades to a warning. A message-size line
+        is never worth killing a finished run for."""
+        if not self.msg_size_on:
+            return
+        try:
+            t_ns = time.time_ns()
+            bid = int(batch_id) if batch_id is not None else -1
+            self._msg_sizes.append((t_ns, bid, int(nbytes)))
+            if self._msg_size_fh is None:
+                # "w": one run per file, same truncate-at-start rule the server's
+                # result files follow.
+                self._msg_size_fh = open(self._msg_size_log_path(), "w")
+            # Same keys and the same unit (MB = 10^6) the server's series file
+            # uses, so the local copy and the archived one read identically.
+            self._msg_size_fh.write(
+                f"{t_ns} client={self.client_id} cluster={self.intermediate_queue} "
+                f"batch_id={bid} bytes={int(nbytes)} mb={nbytes / 1e6:.3f}\n")
+            self._msg_size_fh.flush()
+        except Exception as e:
+            Log.print_with_color(f"[MsgSize] record failed: {e}", "yellow")
+            self.msg_size_on = False   # one warning, not one per batch
+
+    def _send_msg_size(self, role):
+        """Ship the designated edge's message-size samples to the server at finish.
+
+        Sample times travel as OFFSETS from this device's first publish, never as
+        absolute device timestamps: the server writes them into a shared result
+        file, and every timestamp in a shared file has to be the server's own
+        clock (guide invariant 1). The offsets are within one device, so they are
+        exact.
+
+        Report parks on the broker until the server's shutdown collection drains
+        it — same pattern as utilization and free time."""
+        if self._msg_size_fh is not None:
+            try:
+                self._msg_size_fh.close()
+            except Exception:
+                pass
+            self._msg_size_fh = None
+        if not self.msg_size_on or not self._msg_sizes:
+            return
+        t0 = self._msg_sizes[0][0]
+        samples = [(t - t0, bid, n) for t, bid, n in self._msg_sizes]
+        # A long run must not turn the report into a multi-megabyte message.
+        # Decimate evenly rather than truncating, so the series still covers the
+        # whole run; the stats the server prints are computed from the full set
+        # here, so decimation only ever coarsens the plot.
+        cap = max(1, int(self.msg_size_max_samples))
+        if len(samples) > cap:
+            step = len(samples) / cap
+            samples = [samples[int(i * step)] for i in range(cap)]
+        message = {
+            "action": "MSGSIZE",
+            "client_id": str(self.client_id),
+            "layer_id": self.layer_id,
+            "role": role,
+            "machine": self.machine,
+            "cluster_id": self.intermediate_queue,
+            "n": len(self._msg_sizes),
+            "bytes": [n for _, _, n in self._msg_sizes],
+            "samples": samples,
+            "span_ns": self._msg_sizes[-1][0] - t0,
+            "sampled": len(samples),
+        }
+        message.update(self._msg_size_ctx)
+        sizes = message["bytes"]
+        Log.print_with_color(
+            f"[MsgSize][{role}] {len(sizes)} message(s) "
+            f"mean={sum(sizes) / len(sizes) / 1e6:.2f}MB "
+            f"max={max(sizes) / 1e6:.2f}MB "
+            f"total={sum(sizes) / 1e9:.2f}GB -> {self._msg_size_log_path()}", "cyan")
+        try:
+            self.channel.queue_declare(self.msgsize_queue, durable=False)
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=self.msgsize_queue,
+                body=pickle.dumps(message),
+            )
+        except Exception as e:
+            Log.print_with_color(f"[MsgSize] send failed: {e}", "yellow")
+
     def send_next_layer(self, intermediate_queue, data, compress):
 
         with self._ft.work("compress"):
@@ -282,7 +397,7 @@ class Scheduler:
                 "data": data
             })
             self.size_message = len(message)
-
+            self._record_msg_size(len(message), data.get("batch_id"))
 
             self.channel.basic_publish(
                 exchange='',
@@ -814,6 +929,7 @@ class Scheduler:
                         }
                         body = pickle.dumps({"action": "OUTPUT", "data": payload})
                         self.size_message = len(body)
+                        self._record_msg_size(len(body), batch_id)
                         self.channel.basic_publish(exchange='', routing_key=self.intermediate_queue, body=body)
                     send_ms = (time.perf_counter() - _send_start) * 1000
 
@@ -923,6 +1039,9 @@ class Scheduler:
         # is on the broker when the server starts its shutdown sequence.
         self._send_utilization(self._compute_utilization(self._timing_events_edge, "edge"))
         self._send_free_time("edge")
+        # No-op unless the server designated this edge as the one that measures
+        # message size (see _record_msg_size).
+        self._send_msg_size("edge")
         # only_edge: this device ran postprocess_yolo itself (_map_updated flags
         # that _update_map ran), so it — not a cloud — owns the mAP report.
         if self._map_updated:
@@ -1787,13 +1906,14 @@ class Scheduler:
                 pass
             method_frame, _, body = self.channel.basic_get(queue=self.ctrl_queue, auto_ack=True)
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None, map_cfg=None, free_time=None):
+    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress, mode="split", queue_name="intermediate_queue", save_set=None, adaptive=None, multithreading=None, backpressure=None, detections=None, map_cfg=None, free_time=None, msg_size=None):
         adaptive = adaptive or {}
         multithreading = multithreading or {}
         backpressure = backpressure or {}
         detections = detections or {}
         map_cfg = map_cfg or {}
         free_time = free_time or {}
+        msg_size = msg_size or {}
         # Free-time accounting adds one interval record per work stage per batch
         # (plus one per captured frame), so it is off the hot path by construction
         # — but it stays configurable because it is telemetry, and telemetry
@@ -1828,6 +1948,18 @@ class Scheduler:
             Log.print_with_color(
                 "[mAP] per-batch mAP OFF (no conf=0.001 pass, no pred files, no metric "
                 "updates). map.log/map_window.log will be empty for this run.", "yellow")
+        # 'measure' is decided by the SERVER (first client registered at layer 1)
+        # and travels in START — this device never decides for itself, so the
+        # measurement can't end up on two machines or none.
+        self.msg_size_on = bool(msg_size.get("measure", False))
+        self.msg_size_max_samples = int(msg_size.get("max_samples") or 5000)
+        self._msg_size_ctx = {
+            "compress": bool((compress or {}).get("enable", False)),
+            "num_bit": (compress or {}).get("num_bit"),
+            "batch_size": int(batch_size),
+            "splits": int(splits) if splits is not None else None,
+            "mode": mode,
+        }
         if self.mt_on:
             Log.print_with_color(f"[Pipeline] multithreading ON (queue_size={self.mt_queue_size})", "cyan")
         if self.backpressure_on:
@@ -1835,6 +1967,13 @@ class Scheduler:
         if queue_name != self.intermediate_queue:
             self.intermediate_queue = queue_name
             self.channel.queue_declare(self.intermediate_queue, durable=False)
+
+        # After the cluster queue is known: the local log's name carries the
+        # cluster tag, so printing it earlier would name a file that never appears.
+        if self.msg_size_on:
+            Log.print_with_color(
+                f"[MsgSize] THIS device measures published message size, before "
+                f"publish (first edge registered) -> {self._msg_size_log_path()}", "cyan")
 
         if self.layer_id == 1:
             try:

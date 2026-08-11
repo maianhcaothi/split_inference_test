@@ -153,6 +153,11 @@ class Server:
         self.map_cfg = config.get("map", {})
         self.free_time_cfg = config.get("free_time", {})
         self.broker_ram_cfg = config.get("broker_ram", {})
+        self.msg_size_cfg = config.get("message_size", {}) or {}
+        # Which device measures published message size. Chosen in notify_clients
+        # as the FIRST client that registered at layer 1, and told to measure via
+        # its START message — no client decides this for itself.
+        self._msg_size_client = None
         self.cluster_state = {}       # {queue_name: {"queue", "cut", "edges": [client_id,...]}}
         self._num_layers = None       # L, total model layers (for clamping the cut)
         self._adaptive_thread = None
@@ -205,6 +210,13 @@ class Server:
         # can't inherit a crashed run's reports.
         self.channel.queue_declare(queue='freetime_queue', durable=False)
         self.channel.queue_purge(queue='freetime_queue')
+
+        # Message-size report: the ONE designated edge (first registered at layer
+        # 1) publishes the sizes of every message it put on the wire, measured
+        # before publish. Same collect-at-shutdown contract as the two queues
+        # above; purged so a new run can't inherit a crashed run's report.
+        self.channel.queue_declare(queue='msgsize_queue', durable=False)
+        self.channel.queue_purge(queue='msgsize_queue')
 
         # mAP pred files: whichever tier runs postprocess_yolo (last_layer/
         # only_edge) zips up its own map/pred/*.txt files and publishes them to
@@ -306,6 +318,14 @@ class Server:
         self.free_time_series_log_path = f"{log_path}/free_time_series.log"
         open(self.free_time_series_log_path, "w").close()
         self._server_cpu0 = None   # host idle sample for the server's own machine
+        # ── message size (what one edge actually puts on the wire) ──
+        # One summary line for the measured device, and the plottable series it
+        # shipped: one line per published message. Written by _collect_msg_size
+        # at shutdown from the report the designated edge published.
+        self.msg_size_log_path = f"{log_path}/message_size.log"
+        open(self.msg_size_log_path, "w").close()
+        self.msg_size_series_log_path = f"{log_path}/message_size_series.log"
+        open(self.msg_size_series_log_path, "w").close()
         # ── RAM of the queue host (the machine running RabbitMQ) ──
         # Nothing of ours runs on that box, so the server pulls its memory from
         # outside over SSH for the whole run — see src/BrokerRam.py. One line per
@@ -316,6 +336,16 @@ class Server:
         self.broker_ram_log_path = f"{log_path}/broker_ram.log"
         open(self.broker_ram_log_path, "w").close()
         self._broker_ram = self._make_broker_ram_monitor()
+        # Start sampling HERE, in __init__ — not at dispatch. Nothing has been
+        # published yet and no client has even registered, so these first samples
+        # are the queue host at rest: the same machine, measured the same way,
+        # with the system not running. Without that reference every later number
+        # is "RAM this box happens to be using", and the question the curve is
+        # supposed to answer — how much does running the system cost the broker —
+        # has no denominator. The run's own window is marked out inside the
+        # series (see mark('dispatch') / mark('finish')), so nothing is lost by
+        # measuring more.
+        self._start_broker_ram()
         # mAP summary: two lines per cluster (WINDOW = pipeline 1, ALL = pipeline 2)
         # plus one OVERALL line per pipeline, appended by _collect_map_pred at
         # shutdown. Truncated here so runs never mix.
@@ -1036,6 +1066,121 @@ class Server:
             except Exception as e:
                 src.Log.print_with_color(f"[FreeTime] log write failed ({path}): {e}", "yellow")
 
+    def _collect_msg_size(self, timeout_s=None):
+        """Shutdown step: drain the designated edge's MSGSIZE report and write
+        message_size.log (one summary line) + message_size_series.log (one line
+        per published message).
+
+        Exactly ONE report is expected, because exactly one device was told to
+        measure — the first client that registered at layer 1. Every edge in a
+        cluster publishes the same feature map from the same cut, so measuring
+        all nine costs nine times as much and answers the same question.
+
+        Same flag-honoured-at-both-ends contract as free time: when the feature is
+        off nobody will ever publish here, so waiting the full timeout would only
+        stall the shutdown and then warn about a queue that was never going to
+        receive anything."""
+        if self.msg_size_cfg.get("enable", True) is False:
+            src.Log.print_with_color(
+                "[MsgSize] skipped (message_size.enable=False) — no device measured "
+                "published message size", "yellow")
+            return
+        if self._msg_size_client is None:
+            src.Log.print_with_color(
+                "[MsgSize] no edge (layer_id=1) registered — nothing to collect", "yellow")
+            return
+        if timeout_s is None:
+            timeout_s = float(self.msg_size_cfg.get("collect_timeout_s") or 30.0)
+        deadline = time.time() + timeout_s
+        report = None
+        while report is None and time.time() < deadline:
+            method_frame, _, body = self.channel.basic_get(queue='msgsize_queue', auto_ack=True)
+            if not method_frame:
+                time.sleep(0.2)
+                continue
+            try:
+                msg = pickle.loads(body)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("action") == "MSGSIZE":
+                report = msg
+        if report is None:
+            src.Log.print_with_color(
+                f"[MsgSize] no report from {self._msg_size_client} within "
+                f"{timeout_s:.0f}s — message_size.log will be empty", "yellow")
+            return
+        self._report_msg_size(report)
+
+    def _report_msg_size(self, rep):
+        """Turn the measured edge's report into the two result files + a console
+        block.
+
+        The device shipped sample times as OFFSETS from its own first publish, so
+        nothing here carries a device clock: every line starts with the server's
+        t_ns, exactly like free_time_series.log, and the offsets locate a sample
+        inside the run without ever being compared against another machine."""
+        t_ns = time.time_ns()
+        sizes = [int(b) for b in rep.get("bytes", [])]
+        if not sizes:
+            return
+        st = self._stats_ms(sizes)          # generic n/mean/p50/p95/max, nearest-rank
+        span_s = rep.get("span_ns", 0) / 1e9
+        total_b = sum(sizes)
+        bs = int(rep.get("batch_size") or 0)
+        # MB everywhere (10^6, matching broker_ram.log so the two files compare
+        # directly), 3 decimals so a 1 KB message is still resolved.
+        MB = 1e6
+
+        summary = (
+            f"{t_ns} client={rep.get('client_id')} role={rep.get('role')} "
+            f"machine={rep.get('machine')} cluster={rep.get('cluster_id')} "
+            f"mode={rep.get('mode')} splits={rep.get('splits')} "
+            f"compress={'on' if rep.get('compress') else 'off'}"
+            + (f" num_bit={rep.get('num_bit')}" if rep.get("compress") else "")
+            + f" batch_size={bs} n={st['n']} "
+            f"total_mb={total_b / MB:.3f} "
+            f"mean_mb={st['mean'] / MB:.3f} p50_mb={st['p50'] / MB:.3f} "
+            f"p95_mb={st['p95'] / MB:.3f} max_mb={st['max'] / MB:.3f} "
+            f"min_mb={min(sizes) / MB:.3f} "
+            f"span_s={span_s:.3f} "
+            f"rate_mb_s={(total_b / MB / span_s) if span_s else 0.0:.3f}"
+            + (f" per_frame_mb={st['mean'] / bs / MB:.4f}" if bs else "")
+        )
+
+        series = []
+        for i, (off_ns, batch_id, nbytes) in enumerate(rep.get("samples", [])):
+            series.append(
+                f"{t_ns} client={rep.get('client_id')} cluster={rep.get('cluster_id')} "
+                f"i={i} t_offset_s={off_ns / 1e9:.3f} batch_id={batch_id} "
+                f"bytes={int(nbytes)} mb={nbytes / MB:.3f}")
+
+        print("=" * 60)
+        print("  [MESSAGE SIZE]  bytes handed to the broker per message,")
+        print("                  measured before publish on ONE edge")
+        print(f"  [device]  {rep.get('client_id')}  role={rep.get('role')}  "
+              f"cluster={rep.get('cluster_id')}  "
+              f"compress={'on' if rep.get('compress') else 'off'}")
+        print(f"  [size]    n={st['n']}  mean={st['mean'] / MB:6.2f}MB  "
+              f"p50={st['p50'] / MB:6.2f}MB  p95={st['p95'] / MB:6.2f}MB  "
+              f"max={st['max'] / MB:6.2f}MB")
+        print(f"  [total]   {total_b / 1e9:.3f}GB over {span_s:.1f}s  "
+              f"= {(total_b / MB / span_s) if span_s else 0.0:.2f} MB/s from this device"
+              + (f"   ({st['mean'] / bs / MB:.3f} MB/frame)" if bs else ""))
+        if len(rep.get("samples", [])) < st["n"]:
+            print(f"  [series]  {len(rep.get('samples', []))} of {st['n']} samples "
+                  f"(decimated for transport; stats above use all {st['n']})")
+        print("=" * 60)
+
+        for path, out in ((self.msg_size_log_path, [summary]),
+                          (self.msg_size_series_log_path, series)):
+            if not out:
+                continue
+            try:
+                with open(path, "a") as f:
+                    f.write("\n".join(out) + "\n")
+            except Exception as e:
+                src.Log.print_with_color(f"[MsgSize] log write failed ({path}): {e}", "yellow")
+
     def _make_broker_ram_monitor(self):
         """Build (but don't start) the queue-host RAM sampler.
 
@@ -1068,11 +1213,14 @@ class Server:
         )
 
     def _start_broker_ram(self):
-        """Begin sampling the queue host. Called at the START fan-out so the
-        first sample is the broker's baseline with every queue still empty —
-        which is what makes `growth_mb` in the summary mean 'RAM this run
-        added'. Never fatal: a telemetry channel that can't open must not stop a
-        run from happening."""
+        """Begin sampling the queue host. Called from __init__, before any client
+        has registered and long before anything is published, so the series opens
+        on the host at rest. That idle stretch is the baseline every other number
+        in broker_ram.log is read against; the run's own boundaries are recorded
+        inside the series by mark('dispatch') and mark('finish').
+
+        Never fatal: a telemetry channel that can't open must not stop a run from
+        happening."""
         m = self._broker_ram
         if m is None or not m.enable:
             return
@@ -1095,16 +1243,32 @@ class Server:
                 f"[BrokerRAM] no RAM samples from {m.host}: {m.error}", "yellow")
 
     def _report_broker_ram(self):
-        """Shutdown step: stop sampling and write broker_ram.log.
+        """Shutdown step: close the window, stop sampling, write broker_ram.log.
 
         Runs after every other collection, so the window covers the run AND the
         shutdown drain — the drain is exactly when a backed-up broker gives its
         memory back, and a curve that doesn't fall there is the signal that
-        something is still holding messages."""
+        something is still holding messages.
+
+        Then it keeps sampling for a short TAIL past the end of the run. Stopping
+        at the last collection would make the final sample the one taken while the
+        drain was still in flight, and the question this meter exists to answer —
+        what does the host look like when the system is NOT running — would be
+        answered with the busiest moment of the shutdown. A couple of seconds is
+        enough to catch the release; it is deliberately not long enough to wait
+        out the broker's own garbage collection, so a positive tail is 'not back
+        yet', not proof of a leak."""
         m = self._broker_ram
         if m is None or not m.enable:
             return
         try:
+            m.mark("finish")
+            tail_s = float((self.broker_ram_cfg or {}).get("tail_s") or 2.0)
+            if tail_s > 0:
+                src.Log.print_with_color(
+                    f"[BrokerRAM] run finished; sampling {tail_s:.1f}s more to see "
+                    f"{m.host} settle", "cyan")
+                time.sleep(tail_s)
             m.stop()
             s = m.write_summary(self.broker_ram_log_path)
         except Exception as e:
@@ -1128,6 +1292,32 @@ class Server:
         if host_ram:
             print(f"  rabbitmq process  mean={s['rss']['mean']:.1f} MB   "
                   f"max={s['rss']['max']:.1f} MB   swap_max={s['swap_max_mb']:.1f} MB")
+        # The comparison the phases exist for: this host with the system running
+        # against this host at rest, measured the same way in the same series.
+        ph = s.get("phases") or {}
+        if ph:
+            print("  " + "-" * 56)
+            for name, label in (("idle", "idle (before dispatch)"),
+                                ("run", "running"),
+                                ("tail", "after finish")):
+                p = ph.get(name)
+                if not p:
+                    continue
+                print(f"  [{name:<4}] {label:<24} {p['span_s']:8.1f}s  "
+                      f"mean={p['used']['mean']:8.1f} MB   max={p['used']['max']:8.1f} MB   "
+                      f"({p['samples']} samples)")
+            idle, run, tail = ph.get("idle"), ph.get("run"), ph.get("tail")
+            if idle and run:
+                base = idle["used"]["mean"]
+                print(f"  [cost] running the system costs {m.host} "
+                      f"{run['used']['mean'] - base:+.1f} MB on average, "
+                      f"{run['used']['max'] - base:+.1f} MB at peak, over idle")
+                if tail:
+                    print(f"         {tail['span_s']:.1f}s after finish it sits "
+                          f"{tail['used']['mean'] - base:+.1f} MB over idle")
+            elif not idle:
+                print("  [cost] no idle samples — sampler started after dispatch, "
+                      "so there is no at-rest reference this run")
         print("=" * 60)
 
     def _server_host_idle_pct(self):
@@ -1537,6 +1727,8 @@ class Server:
             "free_time.log",
             "free_time_cluster.log",
             "free_time_series.log",
+            "message_size.log",
+            "message_size_series.log",
             "broker_ram.log",
             "broker_ram_ns.log",
             "cut_change_ns.log",
@@ -1641,6 +1833,7 @@ class Server:
         # before closing the connection.
         self._collect_utilization()
         self._collect_free_time()
+        self._collect_msg_size()
         self._collect_map_pred()
         # Last meter to close: it is the only one still sampling, and the drain
         # above is part of what it is measuring.
@@ -2263,6 +2456,24 @@ class Server:
 
             self._build_cluster_state(mode, clients_to_notify, splits)
 
+            # Message size is measured on exactly ONE device: the first client
+            # that registered at layer 1 — clients_to_notify preserves REGISTER
+            # arrival order, so [0] of the layer-1 entries IS that client. Chosen
+            # here, on the server, and carried in that client's START message, so
+            # the job can never land on two machines or on none (README
+            # invariant 9: the run's configuration has exactly one home).
+            if self.msg_size_cfg.get("enable", True) is not False:
+                self._msg_size_client = next(
+                    (cid for cid, lid in clients_to_notify if lid == 1), None)
+                if self._msg_size_client is None:
+                    src.Log.print_with_color(
+                        "[MsgSize] no client registered at layer 1 — message size "
+                        "will not be measured this run", "yellow")
+                else:
+                    src.Log.print_with_color(
+                        f"[MsgSize] measuring published message size on "
+                        f"{self._msg_size_client} (first edge to register)", "cyan")
+
             for (client_id, layer_id) in clients_to_notify:
                 assignment = self.client_assignments.get(client_id, {})
                 response = {
@@ -2283,6 +2494,10 @@ class Server:
                     "detections": self.detections_cfg,
                     "map":        self.map_cfg,
                     "free_time":  self.free_time_cfg,
+                    # measure=True for the designated edge only; every other
+                    # client gets the same block with measure=False.
+                    "message_size": {**self.msg_size_cfg,
+                                     "measure": client_id == self._msg_size_client},
                 }
                 self.send_to_response(client_id, pickle.dumps(response))
 
@@ -2300,9 +2515,11 @@ class Server:
             # window matches the devices' run span as closely as it can.
             from src.FreeTime import host_cpu_times
             self._server_cpu0 = host_cpu_times()
-            # Same t0 again for the queue host's RAM, so its first sample is the
-            # broker's baseline before any batch has been published.
-            self._start_broker_ram()
+            # The queue host has been sampled since __init__; this only records
+            # where the idle stretch ends and the run begins, so the summary can
+            # report the two separately.
+            if self._broker_ram is not None:
+                self._broker_ram.mark("dispatch")
 
             self._start_adaptive_controller()
         else:

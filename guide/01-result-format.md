@@ -60,6 +60,27 @@ start.
 | 8 | `free_time.log` | shutdown | one line per device | **MAY** |
 | 9 | `free_time_group.log` | shutdown | per group, per group/role, per machine, + `SYSTEM` | **MAY** |
 | 10 | `free_time_series.log` | shutdown | one line per device per time bucket | **MAY** |
+| 11 | `broker_ram_ns.log` | live | one line per RAM sample of the queue host | **MAY** |
+| 12 | `broker_ram.log` | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT`, then `PHASE` per phase + `COMPARE` | **MAY** |
+| 13 | `message_size.log` | shutdown | one line per measured worker | **MAY** |
+| 14 | `message_size_series.log` | shutdown | one line per published message | **MAY** |
+
+Files 13–14 are one feature — emit both or neither. They measure the **size of the
+payload one worker puts on the wire**, recorded before each publish. Exactly one worker
+measures it — the first to register at the first stage, chosen by the server and told via
+the dispatch message. See [12-message-size.md](12-message-size.md).
+
+Files 11–12 are one feature — emit both or neither. They measure the **RAM of the
+machine hosting the message queue**, sampled by the server (nothing of ours runs on that
+machine, so it is pulled from outside over SSH). Every line carries `source=`: `ssh` means
+host memory from `/proc/meminfo`, `rabbitmq_api` means the management-API fallback, where
+`used_mb` is the **broker process**, not the host.
+
+The window opens at **server start** — before any worker registers or anything is
+published — and closes a second or two **after** the run, so the series contains the host
+at rest as well as under load. Every sample carries `phase=` (`idle` / `run` / `tail`) and
+the summary reports each phase plus a `COMPARE` line stating what running the system cost
+that host. See [11-broker-ram.md §6](11-broker-ram.md).
 
 Files 8–10 are one feature — emit all three or none. They measure **free time**: the
 wall clock in which a device did no work of any kind. See
@@ -419,6 +440,60 @@ device idle" series; it is written at shutdown but describes the whole run.
 
 ---
 
+### 3.11 `message_size.log` — payload size, per measured worker (optional)
+
+One line per worker that measured, which is normally exactly one: the first worker that
+registered at the first stage, selected by the server ([12](12-message-size.md)).
+
+```
+1786366279200770600 client=machine-2 role=edge machine=machine-2 cluster=intermediate_queue_0 mode=split splits=5 compress=on num_bit=8 batch_size=32 n=504 total_mb=19657.464 mean_mb=39.003 p50_mb=39.022 p95_mb=39.613 max_mb=40.098 min_mb=37.909 span_s=714.260 rate_mb_s=27.521 per_frame_mb=1.2188
+```
+
+| Key | Meaning |
+|---|---|
+| `n` | messages this worker published |
+| `total_mb` | bytes put on the wire over the run (MB = 10⁶) |
+| `mean_mb`, `p50_mb`, `p95_mb`, `max_mb`, `min_mb` | per-message size; percentiles nearest-rank over the raw samples |
+| `span_s` | first → last publish, that worker's clock |
+| `rate_mb_s` | `total_mb / span_s`, this worker's egress |
+| `per_frame_mb` | `mean_mb / unit_size` |
+
+**Rules**
+- Sizes MUST be the **serialized** bytes handed to the transport, measured **before** the
+  publish call.
+- Statistics MUST be computed over every sample, even when the shipped series is
+  decimated.
+- The line MUST carry the context that determines the size (compression, split point,
+  mode, unit size). A size without them cannot be reproduced.
+
+---
+
+### 3.12 `message_size_series.log` — payload size over the run (optional)
+
+One line per published message. Written at shutdown, describes the whole run.
+
+```
+1786366279200770600 client=machine-2 cluster=intermediate_queue_0 i=0 t_offset_s=0.000 batch_id=0 bytes=38897647 mb=38.898
+1786366279200770600 client=machine-2 cluster=intermediate_queue_0 i=1 t_offset_s=1.420 batch_id=1 bytes=39104512 mb=39.105
+```
+
+| Key | Meaning |
+|---|---|
+| col 1 | ns-epoch arrival of the report at the server, identical on every line |
+| `i` | sample index |
+| `t_offset_s` | seconds since that worker's **own first publish** |
+| `bytes` | exact integer, the authoritative value |
+| `mb` | same number in MB |
+
+**Rules**
+- Same split of clocks as [§3.10](#310-free_time_serieslog--free-time-over-the-run-optional):
+  the leading timestamp is the server's, the position in the run is `t_offset_s` on the
+  worker's clock. Never conflate them.
+- A long run MAY decimate this series evenly to bound its size; it MUST NOT truncate it,
+  and `i` MUST stay non-decreasing.
+
+---
+
 ## 4 · Truncation and lifecycle
 
 ```
@@ -433,6 +508,7 @@ drain       keep collecting after the first stage finishes (02 §5)
 shutdown    group_rate.log
             utilization.log → utilization_group.log, latency_group.log
             free_time.log → free_time_group.log, free_time_series.log   (optional)
+            message_size.log → message_size_series.log                  (optional)
    │
 archive     copy everything + the config that produced it  (05)
 ```

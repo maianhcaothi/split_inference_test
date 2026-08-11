@@ -192,3 +192,23 @@ waiting for the edges" a picture instead of a paragraph.
 
 Free time is a **capacity** measurement, not a performance one. A fleet at 60% free is
 not slow; it is three times larger than the workload needs.
+
+---
+
+## 7 · Self-check
+
+Four invariants hold by construction. They are cheap to assert and each one fails loudly
+when the implementation is wrong in the way this measurement is usually wrong:
+
+| Invariant | What its failure means |
+|---|---|
+| `busy_ns + free_ns == span_ns`, exactly | intervals escaped the run window, or the clip step is missing |
+| `Σ free_reasons == free_ns`, exactly | attribution double-counts (reasons overlap) or leaks (`unaccounted` not emitted) |
+| `Σ per-kind durations > merged busy` on a pipelined worker | if equal, lanes are being **summed** instead of merged — the error this whole method exists to prevent |
+| `busy_ns ≤ span_ns` | same bug, caught from the other side |
+
+Test them on a synthetic device: run two threads doing known-length work that overlaps in
+time. The sum of the per-kind timers will be about twice the merged busy interval, and
+the merged value is the one that must appear in the report. A run where those two numbers
+agree is a run where the merge is silently a sum — and free time will read far too low
+with nothing else looking wrong.

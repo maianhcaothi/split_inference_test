@@ -51,6 +51,9 @@ class RpcClient:
             detections = self.response.get("detections", {}) or {}
             map_cfg = self.response.get("map", {}) or {}
             free_time = self.response.get("free_time", {}) or {}
+            # Carries measure=True for exactly one client — the first that
+            # registered at layer 1. The server decides; this client only obeys.
+            msg_size = self.response.get("message_size", {}) or {}
 
             # Which cluster this client landed in. The server names each cluster's
             # queue intermediate_queue_{k}, so the trailing number IS the cluster id.
@@ -107,7 +110,7 @@ class RpcClient:
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive, multithreading, backpressure, detections, map_cfg, free_time)
+            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress, mode, queue_name, save_set, adaptive, multithreading, backpressure, detections, map_cfg, free_time, msg_size)
 
             return False
         else:

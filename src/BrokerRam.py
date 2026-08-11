@@ -127,6 +127,12 @@ class BrokerRamMonitor:
         self.samples = []           # [{t_ns, total_kb, used_kb, ...}, ...]
         self.source = None          # "ssh" | "rabbitmq_api" | None
         self.error = None           # why there is no data, for the summary line
+        # Phase boundaries on the SERVER's clock, set by mark(): "dispatch" when
+        # work is first handed out, "finish" when the run (incl. drain) is over.
+        # They split one continuous series into idle / run / tail, which is the
+        # whole point of starting the sampler at server init: the same machine,
+        # measured the same way, with and without the system running.
+        self.marks = {}
 
         self._proc = None
         self._askpass_dir = None
@@ -153,6 +159,28 @@ class BrokerRamMonitor:
         # SSH refused/absent: keep measuring, but say plainly that the number
         # changed meaning (broker process, not host).
         return self._start_api_fallback()
+
+    def mark(self, name):
+        """Record a phase boundary on the server's clock.
+
+        Two are used: 'dispatch' (work handed out — everything before it is the
+        host at rest) and 'finish' (run over, drain included). Sampling itself
+        never pauses, so the boundaries only ever partition an already-continuous
+        series; a missing mark degrades to a coarser split, never to a gap."""
+        if not self.enable:
+            return
+        with self._lock:
+            self.marks[str(name)] = time.time_ns()
+
+    def _phase(self, t_ns):
+        """Which phase a sample belongs to. No dispatch mark means work never
+        started, so every sample is idle."""
+        d, f = self.marks.get("dispatch"), self.marks.get("finish")
+        if f is not None and t_ns >= f:
+            return "tail"
+        if d is None or t_ns < d:
+            return "idle"
+        return "run"
 
     def stop(self, timeout_s=5.0):
         """Stop sampling. Safe to call twice, and safe to call when start()
@@ -383,9 +411,14 @@ class BrokerRamMonitor:
     def _sample_line(self, s):
         total = s["total_kb"]
         pct = (100.0 * s["used_kb"] / total) if total else 0.0
+        # phase is stamped at write time, which is also sample time: marks only
+        # ever move forward, so a line written before dispatch is idle and stays
+        # idle. Carrying it here makes the series self-describing — a reader can
+        # shade the plot without cross-referencing the summary's mark timestamps.
         return f"{s['t_ns']} " + _fmt_kv(
             host=self.host,
             source=self.source or "ssh",
+            phase=self._phase(s["t_ns"]),
             total_mb=f"{total / _KB:.1f}",
             used_mb=f"{s['used_kb'] / _KB:.1f}",
             used=f"{pct:.2f}%",
@@ -405,12 +438,40 @@ class BrokerRamMonitor:
 
     # ─── report ────────────────────────────────────────────────────────────────
 
+    def _phase_summary(self, ss):
+        """Roll up one phase's samples: how much RAM the host held during it."""
+        if not ss:
+            return None
+        used = [s["used_kb"] / _KB for s in ss]
+        pct = [(100.0 * s["used_kb"] / s["total_kb"]) if s["total_kb"] else 0.0
+               for s in ss]
+        return {
+            "samples": len(ss),
+            "span_s": (ss[-1]["t_ns"] - ss[0]["t_ns"]) / 1e9,
+            "used": _stats(used),
+            "used_pct": _stats(pct),
+            "rss_mean": sum(s["rabbit_rss_kb"] / _KB for s in ss) / len(ss),
+            "rss_max": max(s["rabbit_rss_kb"] / _KB for s in ss),
+            "t_start_ns": ss[0]["t_ns"],
+            "t_end_ns": ss[-1]["t_ns"],
+        }
+
     def summary(self):
-        """Whole-run roll-up, or None when nothing was sampled."""
+        """Whole-run roll-up, or None when nothing was sampled.
+
+        Carries a per-phase breakdown beside the whole-window numbers. The
+        phases are the reason the sampler starts at server init: 'idle' is this
+        exact machine, measured by this exact method, with nothing of ours
+        running on it — the only honest reference for what the run then added."""
         with self._lock:
             ss = list(self.samples)
         if not ss:
             return None
+        by_phase = {}
+        for s in ss:
+            by_phase.setdefault(self._phase(s["t_ns"]), []).append(s)
+        phases = {name: self._phase_summary(rows)
+                  for name, rows in by_phase.items() if rows}
         used = [s["used_kb"] / _KB for s in ss]
         pct = [(100.0 * s["used_kb"] / s["total_kb"]) if s["total_kb"] else 0.0
                for s in ss]
@@ -435,6 +496,8 @@ class BrokerRamMonitor:
             "swap_max_mb": max(s["swap_used_kb"] / _KB for s in ss),
             "t_start_ns": ss[0]["t_ns"],
             "t_end_ns": ss[-1]["t_ns"],
+            "phases": phases,
+            "marks": dict(self.marks),
         }
 
     def write_summary(self, path, t_ns=None):
@@ -473,6 +536,45 @@ class BrokerRamMonitor:
                 mean_rss_mb=f"{s['rss']['mean']:.1f}", max_rss_mb=f"{s['rss']['max']:.1f}",
                 swap_max_mb=f"{s['swap_max_mb']:.1f}"),
         ]
+
+        # One line per phase, in the order they happen, then the comparison the
+        # phases exist for. Phases with no samples are omitted rather than
+        # written as zeros — a run with no idle window should look like one.
+        ph = s.get("phases") or {}
+        for name in ("idle", "run", "tail"):
+            p = ph.get(name)
+            if not p:
+                continue
+            lines.append(
+                f"{t_ns} PHASE " + _fmt_kv(
+                    phase=name, samples=p["samples"], span_s=f"{p['span_s']:.3f}",
+                    min_mb=f"{p['used']['min']:.1f}", mean_mb=f"{p['used']['mean']:.1f}",
+                    p50_mb=f"{p['used']['p50']:.1f}", p95_mb=f"{p['used']['p95']:.1f}",
+                    max_mb=f"{p['used']['max']:.1f}",
+                    mean=f"{p['used_pct']['mean']:.2f}%", max=f"{p['used_pct']['max']:.2f}%",
+                    mean_rss_mb=f"{p['rss_mean']:.1f}", max_rss_mb=f"{p['rss_max']:.1f}",
+                    t_start_ns=p["t_start_ns"], t_end_ns=p["t_end_ns"]))
+
+        idle, run, tail = ph.get("idle"), ph.get("run"), ph.get("tail")
+        if idle and run:
+            base = idle["used"]["mean"]
+            cmp_kv = dict(
+                idle_mean_mb=f"{base:.1f}",
+                run_mean_mb=f"{run['used']['mean']:.1f}",
+                run_minus_idle_mb=f"{run['used']['mean'] - base:.1f}",
+                run_peak_over_idle_mb=f"{run['used']['max'] - base:.1f}",
+                idle_rss_mb=f"{idle['rss_mean']:.1f}",
+                run_rss_mb=f"{run['rss_mean']:.1f}",
+                run_rss_over_idle_mb=f"{run['rss_max'] - idle['rss_mean']:.1f}",
+            )
+            if tail:
+                # Did the host come back to where it started? Measured a couple of
+                # seconds after the run, so a positive number is 'not yet' — it is
+                # only a leak if it stays positive on a later run's idle window.
+                cmp_kv["tail_mean_mb"] = f"{tail['used']['mean']:.1f}"
+                cmp_kv["tail_minus_idle_mb"] = f"{tail['used']['mean'] - base:.1f}"
+                cmp_kv["tail_span_s"] = f"{tail['span_s']:.3f}"
+            lines.append(f"{t_ns} COMPARE " + _fmt_kv(**cmp_kv))
         try:
             with open(path, "a") as fh:
                 fh.write("\n".join(lines) + "\n")

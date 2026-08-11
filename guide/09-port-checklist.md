@@ -75,6 +75,70 @@ Work top to bottom. Every item is testable — no item says "make sure it's good
 
 ---
 
+## Phase 4b · Optional measurements ([10](10-free-time.md), [11](11-broker-ram.md), [12](12-message-size.md))
+
+Skip the block for any feature you are not porting. Do **not** half-port one — each is
+all its files or none ([01 §2](01-result-format.md)).
+
+**Free time ([10](10-free-time.md))**
+
+- [ ] Busy intervals are **merged across lanes**, never summed
+- [ ] `busy_ns + free_ns == span_ns` exactly, per device
+- [ ] Free reasons sum to `free_ns` exactly — attribution is priority-ordered, so no
+      moment is claimed twice and none is left out
+- [ ] `Σ per-kind durations ≥ merged busy` whenever two lanes overlap; if they are equal
+      on a pipelined worker, the merge is not happening
+- [ ] Machine free time comes from the **union of intervals** of the processes on that
+      host, never from averaging their percentages
+- [ ] A disabled tracker reports nothing rather than reporting zeros
+
+**Infrastructure host RAM ([11](11-broker-ram.md))**
+
+- [ ] Sampled by the **server**, over **one** long-lived session — not one connection per
+      sample
+- [ ] `used = MemTotal − MemAvailable`, never `− MemFree`
+- [ ] Every line carries `source=`; a fallback source is labelled, never substituted
+      silently
+- [ ] Series written **live**; summary written at shutdown
+- [ ] Window opens at **controller start** — before any worker registers or anything is
+      published — so the series contains the host **at rest**, not just under load
+- [ ] Window closes **1–2 s after** the run, past the drain, so the last sample is not the
+      busiest moment of the shutdown
+- [ ] `idle` / `run` / `tail` marks **partition** the series; sampling never pauses at a
+      boundary, and a missing mark coarsens the split rather than leaving a gap
+- [ ] The summary states what running the system **cost** the host (run vs idle), not only
+      what the host was holding
+- [ ] A phase with no samples is omitted, never written as zeros
+- [ ] Remote loop is bounded, so an orphaned sampler cannot outlive the run
+- [ ] No samples still writes a `samples=0` line naming the reason
+- [ ] Host login credentials are not confused with the service's application credentials
+
+**Message size ([12](12-message-size.md))**
+
+- [ ] Exactly **one** worker measures — the first registered at the first stage — and the
+      **server** chooses it; no worker reads that decision from its own config
+- [ ] The size is recorded **before** the publish call, not after
+- [ ] The value is the **serialized** byte count handed to the transport
+- [ ] Local file written live, one line per message; report shipped at finish
+- [ ] Sample times ship as **offsets**, so no device clock reaches a shared file
+- [ ] Summary statistics use **all** samples even when the shipped series is decimated
+- [ ] Percentiles are nearest-rank; `min ≤ p50 ≤ p95 ≤ max` holds
+- [ ] The summary line carries the context that determines the size (compression, split
+      point, unit size, mode)
+- [ ] A failed write warns **once** and disables the recorder, rather than warning per
+      message
+
+**Feature flags** — for every optional feature above:
+
+- [ ] The flag lives in the **server's** config and travels in the dispatch message; no
+      worker reads it locally ([README, invariant 9](README.md))
+- [ ] Turning it off also skips the **server's own collector** for it, so shutdown does
+      not burn a timeout polling a queue nobody publishes to
+      ([README, invariant 10](README.md))
+- [ ] The files still exist (empty) when the feature is off
+
+---
+
 ## Phase 5 · Lifecycle & archive ([01 §4](01-result-format.md), [05](05-archiving.md))
 
 - [ ] **All** result files truncated at startup, before any worker can write

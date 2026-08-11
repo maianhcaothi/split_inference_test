@@ -140,9 +140,34 @@ broker_ram:               # RAM của MÁY CHẠY QUEUE (RabbitMQ), do SERVER đ
   password: ""            # cái đó là credential AMQP, không mở được shell)
   ssh_port: 22
   interval_s: 1.0         # chu kỳ lấy mẫu (giây)
+  tail_s: 2.0             # đo THÊM bao nhiêu giây SAU KHI run kết thúc (sau cả drain). Cửa sổ đo
+                          # bắt đầu từ lúc SERVER KHỞI ĐỘNG (chưa client nào đăng ký, chưa message
+                          # nào được gửi) nên đoạn đầu series là máy queue LÚC RẢNH — đó là mốc
+                          # so sánh: chạy hệ thống thì RAM máy queue tăng bao nhiêu so với lúc không
+                          # chạy. Series được chia 3 pha trong broker_ram.log: PHASE idle (trước
+                          # dispatch) / run (đang chạy) / tail (sau khi xong), cộng 1 dòng COMPARE.
+                          # tail ngắn (1-2s) là CỐ Ý: đủ để thấy broker nhả RAM sau drain, không đủ
+                          # để chờ Erlang GC — nên tail còn dương nghĩa là "chưa về", chưa phải leak.
   api_port: 15672         # chỉ dùng cho fallback: nếu SSH không mở được, server chuyển sang management
                           # API. Khi đó used_mb là RAM CỦA TIẾN TRÌNH BROKER, không phải RAM của máy —
                           # log ghi rõ source=rabbitmq_api để không nhầm.
+
+message_size:             # KÍCH THƯỚC MESSAGE edge đẩy lên queue, đo TRƯỚC KHI publish.
+  enable: True            # CHỈ MỘT device đo: client ĐĂNG KÝ ĐẦU TIÊN ở layer_id=1 (thứ tự REGISTER).
+                          # Server chọn và bật cờ measure=True trong START của riêng máy đó — client
+                          # KHÔNG tự quyết định, nên việc đo không bao giờ rơi vào 2 máy hoặc 0 máy.
+                          # Vì sao chỉ 1: mọi edge trong cùng cluster gửi cùng một feature map từ cùng
+                          # một cut, đo cả 9 máy tốn gấp 9 lần mà ra cùng một con số.
+                          #   · device tự ghi message_size_<cluster>_<id>.log ngay trong lúc chạy
+                          #     (mỗi message 1 dòng — bản này sống sót nếu broker/server có sự cố),
+                          #     rồi gửi report về msgsize_queue lúc kết thúc;
+                          #   · server gom lúc shutdown → message_size.log (1 dòng tổng kết) và
+                          #     message_size_series.log (mỗi message 1 dòng, để vẽ).
+                          # Dùng để làm gì: đây là con số giải thích đường RAM của broker (broker_ram)
+                          # và băng thông thực tế mỗi edge chiếm. Batch 32 chưa nén ~39MB/message.
+  collect_timeout_s: 30   # thời gian chờ tối đa để nhận report từ máy được chọn
+  max_samples: 5000       # số mẫu TỐI ĐA gửi kèm cho chuỗi vẽ (thưa đều nếu run dài hơn). Thống kê
+                          # (mean/p50/p95/max) luôn tính trên TOÀN BỘ mẫu, không phải trên phần thưa.
 
 map:                      # 2 pipeline mAP chạy ở Server lúc shutdown (ground truth = map/label/)
   enable: True            # False = TẮT toàn bộ mAP per-batch trên device. Mỗi batch hiện phải trả:

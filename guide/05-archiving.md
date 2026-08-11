@@ -17,6 +17,10 @@ results/
 │   ├── utilization_group.log
 │   ├── latency_group.log
 │   ├── events_ns.log          (only if the feature that writes it ran)
+│   ├── broker_ram_ns.log      (only if the infra-host sampler ran — 11)
+│   ├── broker_ram.log         (only if the infra-host sampler ran — 11)
+│   ├── message_size.log       (only if a worker measured payload size — 12)
+│   ├── message_size_series.log (only if a worker measured payload size — 12)
 │   └── config.yaml            THE CONFIG THAT PRODUCED THESE NUMBERS
 └── visual/
     └── <Name> Visualization.ipynb

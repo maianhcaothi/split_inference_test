@@ -8,7 +8,9 @@ Read this directory and you can make any project emit results that look identica
 every other project's — same filenames, same line formats, same charts, same colors.
 
 > **Scope.** Throughput, latency, device utilization, and — optionally — free time
-> ([10](10-free-time.md)): how much of each device and each machine was idle.
+> ([10](10-free-time.md)): how much of each device and each machine was idle, the RAM
+> of an infrastructure host you run no code on ([11](11-broker-ram.md)), and the size of
+> the payload a worker puts on the wire ([12](12-message-size.md)).
 > Model-accuracy metrics
 > (mAP and friends) are deliberately **out of scope** — nothing here depends on
 > ground-truth labels or a detection task. The pipeline being measured can be doing
@@ -37,7 +39,11 @@ that is the entire point of fixing the format.
 ├── events_ns.log             control-plane events          one line per event (optional)
 ├── free_time.log             per-device idle time          one line per device (optional)
 ├── free_time_group.log       free time rolled up           per group, per machine, SYSTEM (optional)
-└── free_time_series.log      free time over the run        one line per device per bucket (optional)
+├── free_time_series.log      free time over the run        one line per device per bucket (optional)
+├── broker_ram_ns.log         infra-host RAM over the run   one line per sample (optional)
+├── broker_ram.log            infra-host RAM summary        BROKER/USED/DELTA lines (optional)
+├── message_size.log          payload size summary          one line per measured worker (optional)
+└── message_size_series.log   payload size over the run     one line per published message (optional)
 ```
 
 ---
@@ -57,6 +63,8 @@ that is the entire point of fixing the format.
 | 08 | [build-pipeline.md](08-build-pipeline.md) | building the notebook that produces the charts |
 | 09 | [port-checklist.md](09-port-checklist.md) | last — verifying the port is complete |
 | 10 | [free-time.md](10-free-time.md) | measuring how much of the fleet was idle (optional) |
+| 11 | [broker-ram.md](11-broker-ram.md) | measuring an infrastructure host you run no code on (optional) |
+| 12 | [message-size.md](12-message-size.md) | measuring the bytes a worker puts on the wire (optional) |
 
 **If you are producing results:** 01 → 02 → 03 → 04 → 05 → 09.
 **If you are visualizing existing results:** 01 → 06 → 07 → 08 → 09.
@@ -113,6 +121,24 @@ These are not stylistic. Each one exists because the obvious alternative is brok
    a warning. A broken metric loses a number; it must not lose the run.
 8. **Aggregate before you divide.** Throughput is total items / total time, never the
    mean of per-interval rates — bursty arrivals make the latter read 3–4× high.
+9. **The run's configuration has exactly one home.** Workers receive every runtime
+   setting in the dispatch message and read **nothing** from their own config file at
+   run time. Otherwise a measurement flag has to be changed on N machines, the copies
+   drift, and a run silently mixes two configurations. Anything a worker still reads
+   locally (connection details, per-machine thread caps) must be listed explicitly —
+   what is *not* centralized is as important to write down as what is.
+10. **A flag that travels must be honoured at both ends.** When the server turns a
+   feature off, its own shutdown collector for that feature must skip too. A collector
+   that still polls a queue nobody will ever publish to burns its full timeout on every
+   run and then warns `0/N` — a stall and a scary message caused by a setting working
+   exactly as intended.
+11. **Measure every device where devices differ; measure one where they don't.**
+   Utilization and free time are per-device because each device's answer is its own.
+   A property fixed by the configuration — the size of the payload leaving a stage
+   ([12](12-message-size.md)) — is the same on every device in a group, so measuring all
+   of them costs N times as much and produces one number N times. Pick the worker by a
+   rule the server can evaluate before dispatch (registration order), and put the choice
+   in the dispatch message, never in the worker's own config.
 
 ---
 
